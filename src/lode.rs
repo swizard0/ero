@@ -65,6 +65,7 @@ where N: AsRef<str> + Send + 'static,
       FS::Future: Send,
       FNL: FnMut(S) -> FR + Send + 'static,
       FR: IntoFuture<Item = Aquire<R, S>, Error = Error<E>> + 'static,
+      FR::Future: Send,
       E: Debug + Send + 'static,
       R: Send + 'static,
       S: Send + 'static,
@@ -174,69 +175,68 @@ where N: AsRef<str>,
 {
     let ProcessState { aquire_rx, release_rx, params, lode_state, mut lode_fn, } = process_state;
 
-    result(Err(()))
-//     aquire_rx
-//         .select2(release_rx)
-//         .then(move |await_result| {
-//             match await_result {
-//                 Ok(Either::A(((Some(aquire_req), aquire_rx_stream), release_rx))) => {
-//                     let future = lode_fn(lode_state)
-//                         .into_future()
-//                         .then(move |lode_result| {
-//                             Ok(Loop::Break(BreakReason::Shutdown))
+    aquire_rx
+        .select2(release_rx)
+        .then(move |await_result| {
+            match await_result {
+                Ok(Either::A(((Some(aquire_req), aquire_rx_stream), release_rx))) => {
+                    let future = lode_fn(lode_state)
+                        .into_future()
+                        .then(move |lode_result| {
+                            match lode_result {
+                                Ok(Aquire { lode, state, no_more_left, }) => {
+                                    // TODO
 
-//                             // match lode_result {
-//                             //     Ok(Aquire { lode, state, no_more_left, }) => {
-//                             //         // TODO
+                                    let next_state = ProcessState {
+                                        aquire_rx: aquire_rx_stream.into_future(),
+                                        lode_state: state,
+                                        release_rx, params, lode_fn,
+                                    };
+                                    Ok(Loop::Continue(next_state))
+                                },
+                                Err(Error::Recoverable(error)) => {
+                                    Ok(Loop::Break(BreakReason::RequireRestart {
+                                        error,
+                                        state: ProcessState { aquire_rx, release_rx, params, lode_state, lode_fn, },
+                                    }))
+                                },
+                                Err(Error::Fatal(error)) => {
+                                    error!("{} processing crashed with fatal error: {:?}, terminating", params.name.as_ref(), error);
+                                    Err(())
+                                },
+                            }
+                        });
+                    Either::A(future)
+                },
+                Ok(Either::A(((None, aquire_rx_stream), _release_rx))) => {
+                    debug!("aquire channel depleted");
+                    Either::B(result(Ok(Loop::Break(BreakReason::Shutdown))))
+                },
+                Ok(Either::B(((Some(release_req), release_rx_stream), aquire_rx))) => {
+                    // TODO
 
-//                             //         let next_state = ProcessState {
-//                             //             aquire_rx: aquire_rx_stream.into_future(),
-//                             //             release_rx, params, lode_state, lode_fn,
-//                             //         };
-//                             //         Ok(Loop::Continue(next_state))
-//                             //     },
-//                             //     Err(Error::Recoverable(error)) => {
-//                             //         // TODO
+                    // let next_state = ProcessState {
+                    //     release_rx: release_rx_stream.into_future(),
+                    //     aquire_rx, params, lode_state,
+                    // };
+                    // Ok(Loop::Continue(next_state))
 
-//                             //         Ok(Loop::Break(BreakReason::Shutdown))
-//                             //     },
-//                             //     Err(Error::Fatal(error)) => {
-//                             //         error!("{} processing crashed with fatal error: {:?}, terminating", params.name.as_ref(), error);
-//                             //         Err(())
-//                             //     },
-//                             // }
-//                         });
-//                     Either::A(future)
-//                 },
-//                 Ok(Either::A(((None, aquire_rx_stream), _release_rx))) => {
-//                     debug!("aquire channel depleted");
-//                     Either::B(Ok(Loop::Break(BreakReason::Shutdown)))
-//                 },
-//                 Ok(Either::B(((Some(release_req), release_rx_stream), aquire_rx))) => {
-//                     // TODO
-
-//                     // let next_state = ProcessState {
-//                     //     release_rx: release_rx_stream.into_future(),
-//                     //     aquire_rx, params, lode_state,
-//                     // };
-//                     // Ok(Loop::Continue(next_state))
-
-//                     Either::B(Ok(Loop::Break(BreakReason::Shutdown)))
-//                 },
-//                 Ok(Either::B(((None, release_rx_stream), _aquire_rx))) => {
-//                     debug!("release channel depleted");
-//                     Either::B(Ok(Loop::Break(BreakReason::Shutdown)))
-//                 },
-//                 Err(Either::A((((), _aquire_rx), _release_rx))) => {
-//                     debug!("aquire channel outer endpoint dropped");
-//                     Either::B(Ok(Loop::Break(BreakReason::Shutdown)))
-//                 },
-//                 Err(Either::B((((), _release_rx), _aquire_rx))) => {
-//                     debug!("release channel outer endpoint dropped");
-//                     Either::B(Ok(Loop::Break(BreakReason::Shutdown)))
-//                 },
-//             }
-//         })
+                    Either::B(result(Ok(Loop::Break(BreakReason::Shutdown))))
+                },
+                Ok(Either::B(((None, release_rx_stream), _aquire_rx))) => {
+                    debug!("release channel depleted");
+                    Either::B(result(Ok(Loop::Break(BreakReason::Shutdown))))
+                },
+                Err(Either::A((((), _aquire_rx), _release_rx))) => {
+                    debug!("aquire channel outer endpoint dropped");
+                    Either::B(result(Ok(Loop::Break(BreakReason::Shutdown))))
+                },
+                Err(Either::B((((), _release_rx), _aquire_rx))) => {
+                    debug!("release channel outer endpoint dropped");
+                    Either::B(result(Ok(Loop::Break(BreakReason::Shutdown))))
+                },
+            }
+        })
 }
 
 fn proceed_with_restart<N, FNI, FNL, R, E>(
