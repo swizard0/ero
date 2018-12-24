@@ -1,0 +1,10 @@
+[package]
+name = "erlust"
+version = "0.1.0"
+authors = ["Alexey Voznyuk <me@swizard.info>"]
+edition = "2018"
+
+[dependencies]
+log = "0.4"
+tokio = "0.1"
+futures = "0.1"
