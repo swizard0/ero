@@ -66,7 +66,7 @@ pub struct Params<N> {
     restart_delay: Option<Duration>,
 }
 
-fn spawn<N, FNI, FI, S, FNA, FA, FNR, FR, E, R>(
+pub fn spawn<N, FNI, FI, S, FNA, FA, FNR, FR, E, R>(
     executor: &tokio::runtime::TaskExecutor,
     params: Params<N>,
     init_fn: FNI,
@@ -95,13 +95,16 @@ where N: AsRef<str> + Send + 'static,
     executor.spawn(
         loop_fn(
             RestartState {
-                aquire_rx: aquire_rx_stream.into_future(),
-                release_rx: release_rx_stream.into_future(),
-                shutdown_rx,
-                params,
+                core: Core {
+                    aquire_rx: aquire_rx_stream.into_future(),
+                    release_rx: release_rx_stream.into_future(),
+                    aquires_count: 0,
+                    shutdown_rx,
+                    params,
+                    aquire_fn,
+                    release_fn,
+                },
                 init_fn,
-                aquire_fn,
-                release_fn,
             },
             restart_loop,
         )
@@ -114,14 +117,19 @@ where N: AsRef<str> + Send + 'static,
     }
 }
 
-struct RestartState<N, FNI, FNA, FNR, R> {
+struct Core<N, FNA, FNR, R> {
     aquire_rx: stream::StreamFuture<mpsc::Receiver<AquireReq<R>>>,
     release_rx: stream::StreamFuture<mpsc::UnboundedReceiver<ReleaseReq<R>>>,
     shutdown_rx: oneshot::Receiver<Shutdown>,
     params: Params<N>,
-    init_fn: FNI,
     aquire_fn: FNA,
     release_fn: FNR,
+    aquires_count: usize,
+}
+
+struct RestartState<N, FNI, FNA, FNR, R> {
+    core: Core<N, FNA, FNR, R>,
+    init_fn: FNI,
 }
 
 fn restart_loop<N, FNI, FS, S, FNA, FA, FNR, FR, E, R>(
@@ -142,21 +150,15 @@ where N: AsRef<str>,
         .then(move |maybe_lode_state| {
             match maybe_lode_state {
                 Ok(lode_state) => {
-                    let RestartState { aquire_rx, release_rx, shutdown_rx, params, init_fn, aquire_fn, release_fn, } = restart_state;
+                    let RestartState { core, init_fn, } = restart_state;
                     let future =
-                        loop_fn(
-                            ProcessState { aquire_rx, release_rx, shutdown_rx, params, aquire_fn, lode_state, release_fn, },
-                            lode_loop,
-                        )
+                        loop_fn(OuterState { core, lode_state, }, outer_loop)
                         .then(move |inner_loop_result| {
                             match inner_loop_result {
-                                Ok(BreakReason::Shutdown) =>
+                                Ok(BreakOuter::Shutdown) =>
                                     Either::A(result(Ok(Loop::Break(())))),
-                                Ok(BreakReason::RequireRestart { error, aquire_rx, release_rx, shutdown_rx, params, aquire_fn, release_fn, }) => {
-                                    let future = proceed_with_restart(
-                                        RestartState { aquire_rx, release_rx, shutdown_rx, params, init_fn, aquire_fn, release_fn, },
-                                        error,
-                                    );
+                                Ok(BreakOuter::RequireRestart { error, core, }) => {
+                                    let future = proceed_with_restart(RestartState { init_fn, core, }, error);
                                     Either::B(Either::A(future))
                                 },
                                 Err(()) =>
@@ -170,40 +172,30 @@ where N: AsRef<str>,
                     Either::B(Either::A(future))
                 },
                 Err(Error::Fatal(error)) => {
-                    error!("{} crashed with fatal error: {:?}, terminating", restart_state.params.name.as_ref(), error);
+                    error!("{} crashed with fatal error: {:?}, terminating", restart_state.core.params.name.as_ref(), error);
                     Either::B(Either::B(result(Err(()))))
                 },
             }
         })
 }
 
-enum BreakReason<E, R, N, FNA, FNR> {
+enum BreakOuter<E, R, N, FNA, FNR> {
     Shutdown,
     RequireRestart {
         error: E,
-        aquire_rx: stream::StreamFuture<mpsc::Receiver<AquireReq<R>>>,
-        release_rx: stream::StreamFuture<mpsc::UnboundedReceiver<ReleaseReq<R>>>,
-        shutdown_rx: oneshot::Receiver<Shutdown>,
-        params: Params<N>,
-        aquire_fn: FNA,
-        release_fn: FNR,
+        core: Core<N, FNA, FNR, R>,
     },
 }
 
-struct ProcessState<N, S, FNA, FNR, R> {
-    aquire_rx: stream::StreamFuture<mpsc::Receiver<AquireReq<R>>>,
-    release_rx: stream::StreamFuture<mpsc::UnboundedReceiver<ReleaseReq<R>>>,
-    shutdown_rx: oneshot::Receiver<Shutdown>,
-    params: Params<N>,
+struct OuterState<N, S, FNA, FNR, R> {
+    core: Core<N, FNA, FNR, R>,
     lode_state: S,
-    aquire_fn: FNA,
-    release_fn: FNR,
 }
 
-fn lode_loop<N, S, FNA, FA, FNR, FR, E, R>(
-    process_state: ProcessState<N, S, FNA, FNR, R>,
+fn outer_loop<N, S, FNA, FA, FNR, FR, E, R>(
+    outer_state: OuterState<N, S, FNA, FNR, R>,
 )
-    -> impl Future<Item = Loop<BreakReason<E, R, N, FNA, FNR>, ProcessState<N, S, FNA, FNR, R>>, Error = ()>
+    -> impl Future<Item = Loop<BreakOuter<E, R, N, FNA, FNR>, OuterState<N, S, FNA, FNR, R>>, Error = ()>
 where N: AsRef<str>,
       FNA: FnMut(S) -> FA,
       FA: IntoFuture<Item = Aquire<R, S>, Error = Error<E>>,
@@ -211,7 +203,56 @@ where N: AsRef<str>,
       FR: IntoFuture<Item = S, Error = Error<E>>,
       E: Debug,
 {
-    let ProcessState { aquire_rx, release_rx, shutdown_rx, params, lode_state, mut aquire_fn, mut release_fn, } = process_state;
+    let OuterState { core, lode_state, } = outer_state;
+
+    loop_fn(MainState { core, lode_state, }, main_loop)
+        .then(move |inner_loop_result| {
+            match inner_loop_result {
+                Ok(BreakMain::Shutdown) =>
+                    Ok(Loop::Break(BreakOuter::Shutdown)),
+                Ok(BreakMain::RequireRestart { error, core, }) =>
+                    Ok(Loop::Break(BreakOuter::RequireRestart { error, core, })),
+                Ok(BreakMain::WaitRelease { core, }) => {
+                    // TODO
+                    Ok(Loop::Break(BreakOuter::Shutdown))
+                },
+                Err(()) =>
+                    Err(()),
+            }
+        })
+}
+
+enum BreakMain<E, R, N, FNA, FNR> {
+    Shutdown,
+    RequireRestart {
+        error: E,
+        core: Core<N, FNA, FNR, R>,
+    },
+    WaitRelease {
+        core: Core<N, FNA, FNR, R>,
+    },
+}
+
+struct MainState<N, S, FNA, FNR, R> {
+    core: Core<N, FNA, FNR, R>,
+    lode_state: S,
+}
+
+fn main_loop<N, S, FNA, FA, FNR, FR, E, R>(
+    main_state: MainState<N, S, FNA, FNR, R>,
+)
+    -> impl Future<Item = Loop<BreakMain<E, R, N, FNA, FNR>, MainState<N, S, FNA, FNR, R>>, Error = ()>
+where N: AsRef<str>,
+      FNA: FnMut(S) -> FA,
+      FA: IntoFuture<Item = Aquire<R, S>, Error = Error<E>>,
+      FNR: FnMut(S, Option<R>) -> FR,
+      FR: IntoFuture<Item = S, Error = Error<E>>,
+      E: Debug,
+{
+    let MainState {
+        core: Core { aquire_rx, release_rx, shutdown_rx, params, mut aquire_fn, mut release_fn, aquires_count, },
+        lode_state,
+    } = main_state;
 
     aquire_rx
         .select2(release_rx)
@@ -231,21 +272,27 @@ where N: AsRef<str>,
                                         Err(_resource) =>
                                             warn!("receiver has been dropped before resource is aquired"),
                                     }
-                                    let next_state = ProcessState {
-                                        aquire_rx: aquire_rx_stream.into_future(),
+                                    let next_state = MainState {
+                                        core: Core {
+                                            aquire_rx: aquire_rx_stream.into_future(),
+                                            aquires_count: aquires_count + 1,
+                                            release_rx, shutdown_rx, params, aquire_fn, release_fn,
+                                        },
                                         lode_state: state,
-                                        release_rx, shutdown_rx, params, aquire_fn, release_fn,
                                     };
                                     Ok(Loop::Continue(next_state))
                                 },
                                 Err(Error::Recoverable(error)) => {
-                                    Ok(Loop::Break(BreakReason::RequireRestart {
-                                        aquire_rx: aquire_rx_stream.into_future(),
-                                        error, release_rx, shutdown_rx, params, aquire_fn, release_fn,
+                                    Ok(Loop::Break(BreakMain::RequireRestart {
+                                        core: Core {
+                                            aquire_rx: aquire_rx_stream.into_future(),
+                                            release_rx, shutdown_rx, params, aquire_fn, release_fn, aquires_count,
+                                        },
+                                        error,
                                     }))
                                 },
                                 Err(Error::Fatal(error)) => {
-                                    error!("{} processing crashed with fatal error: {:?}, terminating", params.name.as_ref(), error);
+                                    error!("{} crashed with fatal error: {:?}, terminating", params.name.as_ref(), error);
                                     Err(())
                                 },
                             }
@@ -254,7 +301,7 @@ where N: AsRef<str>,
                 },
                 Ok(Either::A((Either::A(((None, aquire_rx_stream), _release_rx)), _shutdown_rx))) => {
                     debug!("aquire channel depleted");
-                    Either::B(result(Ok(Loop::Break(BreakReason::Shutdown))))
+                    Either::B(result(Ok(Loop::Break(BreakMain::Shutdown))))
                 },
                 Ok(Either::A((Either::B(((Some(release_req), release_rx_stream), aquire_rx)), shutdown_rx))) => {
                     // TODO
@@ -265,27 +312,27 @@ where N: AsRef<str>,
                     // };
                     // Ok(Loop::Continue(next_state))
 
-                    Either::B(result(Ok(Loop::Break(BreakReason::Shutdown))))
+                    Either::B(result(Ok(Loop::Break(BreakMain::Shutdown))))
                 },
                 Ok(Either::A((Either::B(((None, release_rx_stream), _aquire_rx)), _shutdown_rx))) => {
                     debug!("release channel depleted");
-                    Either::B(result(Ok(Loop::Break(BreakReason::Shutdown))))
+                    Either::B(result(Ok(Loop::Break(BreakMain::Shutdown))))
                 },
                 Ok(Either::B((Shutdown, _aquire_release_rxs))) => {
                     debug!("shutdown request");
-                    Either::B(result(Ok(Loop::Break(BreakReason::Shutdown))))
+                    Either::B(result(Ok(Loop::Break(BreakMain::Shutdown))))
                 },
                 Err(Either::A((Either::A((((), _aquire_rx), _release_rx)), _shutdown_rx))) => {
                     debug!("aquire channel outer endpoint dropped");
-                    Either::B(result(Ok(Loop::Break(BreakReason::Shutdown))))
+                    Either::B(result(Ok(Loop::Break(BreakMain::Shutdown))))
                 },
                 Err(Either::A((Either::B((((), _release_rx), _aquire_rx)), _shutdown_rx))) => {
                     debug!("release channel outer endpoint dropped");
-                    Either::B(result(Ok(Loop::Break(BreakReason::Shutdown))))
+                    Either::B(result(Ok(Loop::Break(BreakMain::Shutdown))))
                 },
                 Err(Either::B((oneshot::Canceled, _aquire_release_rxs))) => {
                     debug!("release channel outer endpoint dropped");
-                    Either::B(result(Ok(Loop::Break(BreakReason::Shutdown))))
+                    Either::B(result(Ok(Loop::Break(BreakMain::Shutdown))))
                 },
             }
         })
@@ -299,13 +346,13 @@ fn proceed_with_restart<N, FNI, FNA, FNR, R, E>(
 where N: AsRef<str>,
       E: Debug,
 {
-    if let Some(delay) = restart_state.params.restart_delay {
-        error!("{} crashed with: {:?}, restarting in {:?}", restart_state.params.name.as_ref(), error, delay);
+    if let Some(delay) = restart_state.core.params.restart_delay {
+        error!("{} crashed with: {:?}, restarting in {:?}", restart_state.core.params.name.as_ref(), error, delay);
         let future = Delay::new(Instant::now() + delay)
             .then(|_delay_result| Ok(Loop::Continue(restart_state)));
         Either::A(future)
     } else {
-        error!("{} crashed with: {:?}, restarting immediately", restart_state.params.name.as_ref(), error);
+        error!("{} crashed with: {:?}, restarting immediately", restart_state.core.params.name.as_ref(), error);
         Either::B(result(Ok(Loop::Continue(restart_state))))
     }
 }
