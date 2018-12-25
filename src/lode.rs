@@ -66,19 +66,23 @@ pub struct Params<N> {
     restart_delay: Option<Duration>,
 }
 
-fn spawn<N, FNI, FS, S, FNL, FR, E, R>(
+fn spawn<N, FNI, FI, S, FNA, FA, FNR, FR, E, R>(
     executor: &tokio::runtime::TaskExecutor,
     params: Params<N>,
     init_fn: FNI,
-    lode_fn: FNL,
+    aquire_fn: FNA,
+    release_fn: FNR,
 )
     -> Lode<R>
 where N: AsRef<str> + Send + 'static,
-      FNI: FnMut() -> FS + Send + 'static,
-      FS: IntoFuture<Item = S, Error = Error<E>> + 'static,
-      FS::Future: Send,
-      FNL: FnMut(S) -> FR + Send + 'static,
-      FR: IntoFuture<Item = Aquire<R, S>, Error = Error<E>> + 'static,
+      FNI: FnMut() -> FI + Send + 'static,
+      FI: IntoFuture<Item = S, Error = Error<E>> + 'static,
+      FI::Future: Send,
+      FNA: FnMut(S) -> FA + Send + 'static,
+      FA: IntoFuture<Item = Aquire<R, S>, Error = Error<E>> + 'static,
+      FA::Future: Send,
+      FNR: FnMut(S, Option<R>) -> FR + Send + 'static,
+      FR: IntoFuture<Item = S, Error = Error<E>> + 'static,
       FR::Future: Send,
       E: Debug + Send + 'static,
       R: Send + 'static,
@@ -96,7 +100,8 @@ where N: AsRef<str> + Send + 'static,
                 shutdown_rx,
                 params,
                 init_fn,
-                lode_fn,
+                aquire_fn,
+                release_fn,
             },
             restart_loop,
         )
@@ -109,24 +114,27 @@ where N: AsRef<str> + Send + 'static,
     }
 }
 
-struct RestartState<N, FNI, FNL, R> {
+struct RestartState<N, FNI, FNA, FNR, R> {
     aquire_rx: stream::StreamFuture<mpsc::Receiver<AquireReq<R>>>,
     release_rx: stream::StreamFuture<mpsc::UnboundedReceiver<ReleaseReq<R>>>,
     shutdown_rx: oneshot::Receiver<Shutdown>,
     params: Params<N>,
     init_fn: FNI,
-    lode_fn: FNL,
+    aquire_fn: FNA,
+    release_fn: FNR,
 }
 
-fn restart_loop<N, FNI, FS, S, FNL, FR, E, R>(
-    mut restart_state: RestartState<N, FNI, FNL, R>,
+fn restart_loop<N, FNI, FS, S, FNA, FA, FNR, FR, E, R>(
+    mut restart_state: RestartState<N, FNI, FNA, FNR, R>,
 )
-    -> impl Future<Item = Loop<(), RestartState<N, FNI, FNL, R>>, Error = ()>
+    -> impl Future<Item = Loop<(), RestartState<N, FNI, FNA, FNR, R>>, Error = ()>
 where N: AsRef<str>,
       FNI: FnMut() -> FS + Send + 'static,
       FS: IntoFuture<Item = S, Error = Error<E>>,
-      FNL: FnMut(S) -> FR,
-      FR: IntoFuture<Item = Aquire<R, S>, Error = Error<E>>,
+      FNA: FnMut(S) -> FA,
+      FA: IntoFuture<Item = Aquire<R, S>, Error = Error<E>>,
+      FNR: FnMut(S, Option<R>) -> FR,
+      FR: IntoFuture<Item = S, Error = Error<E>>,
       E: Debug + Send + 'static,
 {
     (restart_state.init_fn)()
@@ -134,19 +142,19 @@ where N: AsRef<str>,
         .then(move |maybe_lode_state| {
             match maybe_lode_state {
                 Ok(lode_state) => {
-                    let RestartState { aquire_rx, release_rx, shutdown_rx, params, lode_fn, init_fn, } = restart_state;
+                    let RestartState { aquire_rx, release_rx, shutdown_rx, params, init_fn, aquire_fn, release_fn, } = restart_state;
                     let future =
                         loop_fn(
-                            ProcessState { aquire_rx, release_rx, shutdown_rx, params, lode_fn, lode_state, },
+                            ProcessState { aquire_rx, release_rx, shutdown_rx, params, aquire_fn, lode_state, release_fn, },
                             lode_loop,
                         )
                         .then(move |inner_loop_result| {
                             match inner_loop_result {
                                 Ok(BreakReason::Shutdown) =>
                                     Either::A(result(Ok(Loop::Break(())))),
-                                Ok(BreakReason::RequireRestart { error, aquire_rx, release_rx, shutdown_rx, params, lode_fn, }) => {
+                                Ok(BreakReason::RequireRestart { error, aquire_rx, release_rx, shutdown_rx, params, aquire_fn, release_fn, }) => {
                                     let future = proceed_with_restart(
-                                        RestartState { aquire_rx, release_rx, shutdown_rx, params, lode_fn, init_fn, },
+                                        RestartState { aquire_rx, release_rx, shutdown_rx, params, init_fn, aquire_fn, release_fn, },
                                         error,
                                     );
                                     Either::B(Either::A(future))
@@ -169,7 +177,7 @@ where N: AsRef<str>,
         })
 }
 
-enum BreakReason<E, R, N, FNL> {
+enum BreakReason<E, R, N, FNA, FNR> {
     Shutdown,
     RequireRestart {
         error: E,
@@ -177,29 +185,33 @@ enum BreakReason<E, R, N, FNL> {
         release_rx: stream::StreamFuture<mpsc::UnboundedReceiver<ReleaseReq<R>>>,
         shutdown_rx: oneshot::Receiver<Shutdown>,
         params: Params<N>,
-        lode_fn: FNL,
+        aquire_fn: FNA,
+        release_fn: FNR,
     },
 }
 
-struct ProcessState<N, S, FNL, R> {
+struct ProcessState<N, S, FNA, FNR, R> {
     aquire_rx: stream::StreamFuture<mpsc::Receiver<AquireReq<R>>>,
     release_rx: stream::StreamFuture<mpsc::UnboundedReceiver<ReleaseReq<R>>>,
     shutdown_rx: oneshot::Receiver<Shutdown>,
     params: Params<N>,
     lode_state: S,
-    lode_fn: FNL,
+    aquire_fn: FNA,
+    release_fn: FNR,
 }
 
-fn lode_loop<N, S, FNL, FR, E, R>(
-    process_state: ProcessState<N, S, FNL, R>,
+fn lode_loop<N, S, FNA, FA, FNR, FR, E, R>(
+    process_state: ProcessState<N, S, FNA, FNR, R>,
 )
-    -> impl Future<Item = Loop<BreakReason<E, R, N, FNL>, ProcessState<N, S, FNL, R>>, Error = ()>
+    -> impl Future<Item = Loop<BreakReason<E, R, N, FNA, FNR>, ProcessState<N, S, FNA, FNR, R>>, Error = ()>
 where N: AsRef<str>,
-      FNL: FnMut(S) -> FR,
-      FR: IntoFuture<Item = Aquire<R, S>, Error = Error<E>>,
+      FNA: FnMut(S) -> FA,
+      FA: IntoFuture<Item = Aquire<R, S>, Error = Error<E>>,
+      FNR: FnMut(S, Option<R>) -> FR,
+      FR: IntoFuture<Item = S, Error = Error<E>>,
       E: Debug,
 {
-    let ProcessState { aquire_rx, release_rx, shutdown_rx, params, lode_state, mut lode_fn, } = process_state;
+    let ProcessState { aquire_rx, release_rx, shutdown_rx, params, lode_state, mut aquire_fn, mut release_fn, } = process_state;
 
     aquire_rx
         .select2(release_rx)
@@ -208,7 +220,7 @@ where N: AsRef<str>,
             match await_result {
                 Ok(Either::A((Either::A(((Some(AquireReq { reply_tx, }), aquire_rx_stream), release_rx)), shutdown_rx))) => {
                     debug!("aquire request");
-                    let future = lode_fn(lode_state)
+                    let future = aquire_fn(lode_state)
                         .into_future()
                         .then(move |lode_result| {
                             match lode_result {
@@ -222,14 +234,14 @@ where N: AsRef<str>,
                                     let next_state = ProcessState {
                                         aquire_rx: aquire_rx_stream.into_future(),
                                         lode_state: state,
-                                        release_rx, shutdown_rx, params, lode_fn,
+                                        release_rx, shutdown_rx, params, aquire_fn, release_fn,
                                     };
                                     Ok(Loop::Continue(next_state))
                                 },
                                 Err(Error::Recoverable(error)) => {
                                     Ok(Loop::Break(BreakReason::RequireRestart {
                                         aquire_rx: aquire_rx_stream.into_future(),
-                                        error, release_rx, shutdown_rx, params, lode_fn,
+                                        error, release_rx, shutdown_rx, params, aquire_fn, release_fn,
                                     }))
                                 },
                                 Err(Error::Fatal(error)) => {
@@ -279,11 +291,11 @@ where N: AsRef<str>,
         })
 }
 
-fn proceed_with_restart<N, FNI, FNL, R, E>(
-    mut restart_state: RestartState<N, FNI, FNL, R>,
+fn proceed_with_restart<N, FNI, FNA, FNR, R, E>(
+    mut restart_state: RestartState<N, FNI, FNA, FNR, R>,
     error: E,
 )
-    -> impl Future<Item = Loop<(), RestartState<N, FNI, FNL, R>>, Error = ()>
+    -> impl Future<Item = Loop<(), RestartState<N, FNI, FNA, FNR, R>>, Error = ()>
 where N: AsRef<str>,
       E: Debug,
 {
