@@ -224,18 +224,26 @@ where FNA: FnMut(P) -> FA,
     let OuterState { core, state_avail, } = outer_state;
 
     loop_fn(MainState { core, state_avail, }, main_loop)
-        .then(move |inner_loop_result| {
-            match inner_loop_result {
-                Ok(BreakMain::Shutdown) =>
-                    Ok(Loop::Break(BreakOuter::Shutdown)),
-                Ok(BreakMain::RequireRestart { core, init_state, }) =>
-                    Ok(Loop::Break(BreakOuter::RequireRestart { core, init_state, })),
-                Ok(BreakMain::WaitRelease { core, state_no_left, }) => {
-                    // TODO
-                    Ok(Loop::Break(BreakOuter::Shutdown))
+        .and_then(move |main_loop_result| {
+            match main_loop_result {
+                BreakMain::Shutdown =>
+                    Either::A(result(Ok(Loop::Break(BreakOuter::Shutdown)))),
+                BreakMain::RequireRestart { core, init_state, } =>
+                    Either::A(result(Ok(Loop::Break(BreakOuter::RequireRestart { core, init_state, })))),
+                BreakMain::WaitRelease { core, state_no_left, } => {
+                    let future = loop_fn(WaitState { core, state_no_left, }, wait_loop)
+                        .map(move |wait_loop_result| {
+                            match wait_loop_result {
+                                BreakWait::Shutdown =>
+                                    Loop::Break(BreakOuter::Shutdown),
+                                BreakWait::RequireRestart { core, init_state, } =>
+                                    Loop::Break(BreakOuter::RequireRestart { core, init_state, }),
+                                BreakWait::ProceedMain { core, state_avail, } =>
+                                    Loop::Continue(OuterState { core, state_avail, }),
+                            }
+                        });
+                    Either::B(future)
                 },
-                Err(()) =>
-                    Err(()),
             }
         })
 }
@@ -395,8 +403,70 @@ where FNA: FnMut(P) -> FA,
                     Either::B(result(Ok(Loop::Break(BreakMain::Shutdown))))
                 },
                 Err(Either::B((oneshot::Canceled, _aquire_release_rxs))) => {
-                    debug!("release channel outer endpoint dropped");
+                    debug!("shutdown channel outer endpoint dropped");
                     Either::B(result(Ok(Loop::Break(BreakMain::Shutdown))))
+                },
+            }
+        })
+}
+
+enum BreakWait<FNA, FNR, FNC, N, S, R, P> {
+    Shutdown,
+    RequireRestart {
+        core: Core<FNA, FNR, FNC, N, R>,
+        init_state: S,
+    },
+    ProceedMain {
+        core: Core<FNA, FNR, FNC, N, R>,
+        state_avail: P,
+    },
+}
+
+struct WaitState<FNA, FNR, FNC, N, R, Q> {
+    core: Core<FNA, FNR, FNC, N, R>,
+    state_no_left: Q,
+}
+
+fn wait_loop<FNA, FA, FNR, FR, FNC, FC, N, S, R, P, Q>(
+    wait_state: WaitState<FNA, FNR, FNC, N, R, Q>,
+)
+    -> impl Future<Item = Loop<BreakWait<FNA, FNR, FNC, N, S, R, P>, WaitState<FNA, FNR, FNC, N, R, Q>>, Error = ()>
+where FNA: FnMut(P) -> FA,
+      FA: IntoFuture<Item = (R, Resource<P, Q>), Error = ErrorSeverity<S>>,
+      FNR: FnMut(Resource<P, Q>, Option<R>) -> FR,
+      FR: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S>>,
+      FNC: FnMut(Resource<P, Q>) -> FC,
+      FC: IntoFuture<Item = S, Error = ()>,
+      N: AsRef<str>,
+{
+    let WaitState {
+        core: Core { aquire_rx, release_rx, shutdown_rx, params, aquire_fn, mut release_fn, mut close_fn, aquires_count, },
+        state_no_left,
+    } = wait_state;
+
+    release_rx
+        .select2(shutdown_rx)
+        .then(move |await_result| {
+            match await_result {
+                Ok(Either::A(((Some(release_req), release_rx_stream), shutdown_rx))) => {
+                    // TODO
+                    Ok(Loop::Break(BreakWait::Shutdown))
+                },
+                Ok(Either::A(((None, _release_rx_stream), _shutdown_rx))) => {
+                    debug!("release channel depleted");
+                    Ok(Loop::Break(BreakWait::Shutdown))
+                },
+                Ok(Either::B((Shutdown, _release_rx))) => {
+                    debug!("shutdown request");
+                    Ok(Loop::Break(BreakWait::Shutdown))
+                },
+                Err(Either::A((((), _release_rx_stream), _shutdown_rx))) => {
+                    debug!("release channel outer endpoint dropped");
+                    Ok(Loop::Break(BreakWait::Shutdown))
+                },
+                Err(Either::B((oneshot::Canceled, _release_rx))) => {
+                    debug!("shutdown channel outer endpoint dropped");
+                    Ok(Loop::Break(BreakWait::Shutdown))
                 },
             }
         })
