@@ -151,7 +151,7 @@ where FNI: FnMut(S) -> FS + Send + 'static,
       FC: IntoFuture<Item = S, Error = ()>,
       N: AsRef<str>,
 {
-    let RestartState { mut core, mut init_state, mut init_fn, } = restart_state;
+    let RestartState { mut core, init_state, mut init_fn, } = restart_state;
     init_fn(init_state)
         .into_future()
         .then(move |maybe_lode_state| {
@@ -288,7 +288,7 @@ where FNA: FnMut(P) -> FA,
         .then(move |await_result| {
             match await_result {
                 Ok(Either::A((Either::A(((Some(AquireReq { reply_tx, }), aquire_rx_stream), release_rx)), shutdown_rx))) => {
-                    debug!("aquire request");
+                    debug!("main_loop: aquire request");
                     let future = aquire_fn(state_avail)
                         .into_future()
                         .then(move |aquire_result| {
@@ -331,11 +331,11 @@ where FNA: FnMut(P) -> FA,
                     Either::A(Either::A(future))
                 },
                 Ok(Either::A((Either::A(((None, _aquire_rx_stream), _release_rx)), _shutdown_rx))) => {
-                    debug!("aquire channel depleted");
+                    debug!("main_loop: aquire channel depleted");
                     Either::B(result(Ok(Loop::Break(BreakMain::Shutdown))))
                 },
                 Ok(Either::A((Either::B(((Some(release_req), release_rx_stream), aquire_rx)), shutdown_rx))) => {
-                    debug!("release request");
+                    debug!("main_loop: release request");
                     let maybe_resource = match release_req {
                         ReleaseReq::Reimburse(resource) =>
                             Some(Some(resource)),
@@ -387,23 +387,23 @@ where FNA: FnMut(P) -> FA,
                     Either::A(Either::B(future))
                 },
                 Ok(Either::A((Either::B(((None, _release_rx_stream), _aquire_rx)), _shutdown_rx))) => {
-                    debug!("release channel depleted");
+                    debug!("main_loop: release channel depleted");
                     Either::B(result(Ok(Loop::Break(BreakMain::Shutdown))))
                 },
                 Ok(Either::B((Shutdown, _aquire_release_rxs))) => {
-                    debug!("shutdown request");
+                    debug!("main_loop: shutdown request");
                     Either::B(result(Ok(Loop::Break(BreakMain::Shutdown))))
                 },
                 Err(Either::A((Either::A((((), _aquire_rx), _release_rx)), _shutdown_rx))) => {
-                    debug!("aquire channel outer endpoint dropped");
+                    debug!("main_loop: aquire channel outer endpoint dropped");
                     Either::B(result(Ok(Loop::Break(BreakMain::Shutdown))))
                 },
                 Err(Either::A((Either::B((((), _release_rx), _aquire_rx)), _shutdown_rx))) => {
-                    debug!("release channel outer endpoint dropped");
+                    debug!("main_loop: release channel outer endpoint dropped");
                     Either::B(result(Ok(Loop::Break(BreakMain::Shutdown))))
                 },
                 Err(Either::B((oneshot::Canceled, _aquire_release_rxs))) => {
-                    debug!("shutdown channel outer endpoint dropped");
+                    debug!("main_loop: shutdown channel outer endpoint dropped");
                     Either::B(result(Ok(Loop::Break(BreakMain::Shutdown))))
                 },
             }
@@ -449,24 +449,81 @@ where FNA: FnMut(P) -> FA,
         .then(move |await_result| {
             match await_result {
                 Ok(Either::A(((Some(release_req), release_rx_stream), shutdown_rx))) => {
-                    // TODO
-                    Ok(Loop::Break(BreakWait::Shutdown))
+                    let maybe_resource = match release_req {
+                        ReleaseReq::Reimburse(resource) =>
+                            Some(Some(resource)),
+                        ReleaseReq::ResourceLost =>
+                            Some(None),
+                        ReleaseReq::ResourceFault =>
+                            None,
+                    };
+                    let future = if let Some(released_resource) = maybe_resource {
+                        // resource is actually released
+                        let future = release_fn(Resource::OutOfStock(state_no_left), released_resource)
+                            .into_future()
+                            .then(move |release_result| {
+                                let mut core = Core {
+                                    release_rx: release_rx_stream.into_future(),
+                                    aquires_count: if aquires_count > 0 { aquires_count - 1 } else { 0 },
+                                    aquire_rx, shutdown_rx, params, aquire_fn, release_fn, close_fn,
+                                };
+                                match release_result {
+                                    Ok(Resource::Available(state_avail)) =>
+                                        Either::A(result(Ok(Loop::Break(BreakWait::ProceedMain { core, state_avail, })))),
+                                    Ok(Resource::OutOfStock(state_no_left)) =>
+                                        if aquires_count > 0 {
+                                            Either::A(result(Ok(Loop::Continue(WaitState { core, state_no_left, }))))
+                                        } else {
+                                            info!("{} runs out of resources, performing restart", core.params.name.as_ref());
+                                            let future = (core.close_fn)(Resource::OutOfStock(state_no_left))
+                                                .into_future()
+                                                .map(move |init_state| {
+                                                    Loop::Break(BreakWait::RequireRestart { core, init_state, })
+                                                });
+                                            Either::B(future)
+                                        },
+                                    Err(ErrorSeverity::Recoverable { state: init_state, }) =>
+                                        Either::A(result(Ok(Loop::Break(BreakWait::RequireRestart { core, init_state, })))),
+                                    Err(ErrorSeverity::Fatal) => {
+                                        error!("{} crashed with fatal error, terminating", core.params.name.as_ref());
+                                        Either::A(result(Err(())))
+                                    },
+                                }
+                            });
+                        Either::A(future)
+                    } else {
+                        // something wrong with resource, schedule restart
+                        warn!("resource fault report: performing restart");
+                        let future = close_fn(Resource::OutOfStock(state_no_left))
+                            .into_future()
+                            .map(move |init_state| {
+                                Loop::Break(BreakWait::RequireRestart {
+                                    core: Core {
+                                        release_rx: release_rx_stream.into_future(),
+                                        aquire_rx, shutdown_rx, params, aquire_fn, release_fn, close_fn, aquires_count,
+                                    },
+                                    init_state,
+                                })
+                            });
+                        Either::B(future)
+                    };
+                    Either::A(future)
                 },
                 Ok(Either::A(((None, _release_rx_stream), _shutdown_rx))) => {
-                    debug!("release channel depleted");
-                    Ok(Loop::Break(BreakWait::Shutdown))
+                    debug!("wait_loop: release channel depleted");
+                    Either::B(result(Ok(Loop::Break(BreakWait::Shutdown))))
                 },
                 Ok(Either::B((Shutdown, _release_rx))) => {
-                    debug!("shutdown request");
-                    Ok(Loop::Break(BreakWait::Shutdown))
+                    debug!("wait_loop: shutdown request");
+                    Either::B(result(Ok(Loop::Break(BreakWait::Shutdown))))
                 },
                 Err(Either::A((((), _release_rx_stream), _shutdown_rx))) => {
-                    debug!("release channel outer endpoint dropped");
-                    Ok(Loop::Break(BreakWait::Shutdown))
+                    debug!("wait_loop: release channel outer endpoint dropped");
+                    Either::B(result(Ok(Loop::Break(BreakWait::Shutdown))))
                 },
                 Err(Either::B((oneshot::Canceled, _release_rx))) => {
-                    debug!("shutdown channel outer endpoint dropped");
-                    Ok(Loop::Break(BreakWait::Shutdown))
+                    debug!("wait_loop: shutdown channel outer endpoint dropped");
+                    Either::B(result(Ok(Loop::Break(BreakWait::Shutdown))))
                 },
             }
         })
