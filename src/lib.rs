@@ -1,5 +1,10 @@
 pub mod lode;
 
+pub enum ErrorSeverity<S> {
+    Fatal,
+    Recoverable { state: S, },
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
