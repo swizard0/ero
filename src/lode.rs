@@ -1,7 +1,6 @@
 use std::{
     time::{
         Instant,
-        Duration,
     },
 };
 
@@ -31,7 +30,10 @@ use log::{
 
 use tokio::timer::Delay;
 
-use super::ErrorSeverity;
+use super::{
+    ErrorSeverity,
+    RestartStrategy,
+};
 
 struct AquireReq<R> {
     reply_tx: oneshot::Sender<R>,
@@ -58,7 +60,7 @@ pub enum Resource<P, Q> {
 
 pub struct Params<N> {
     name: N,
-    restart_delay: Option<Duration>,
+    restart_strategy: RestartStrategy,
 }
 
 pub fn spawn<FNI, FI, FNA, FA, FNR, FR, FNC, FC, N, S, R, P, Q>(
@@ -651,13 +653,16 @@ fn proceed_with_restart<FNI, FNA, FNR, FNC, N, S, R>(
     -> impl Future<Item = Loop<(), RestartState<FNI, FNA, FNR, FNC, N, S, R>>, Error = ()>
 where N: AsRef<str>,
 {
-    if let Some(delay) = restart_state.core.params.restart_delay {
-        info!("restarting {} in {:?}", restart_state.core.params.name.as_ref(), delay);
-        let future = Delay::new(Instant::now() + delay)
-            .then(|_delay_result| Ok(Loop::Continue(restart_state)));
-        Either::A(future)
-    } else {
-        error!("restarting {} immediately", restart_state.core.params.name.as_ref());
-        Either::B(result(Ok(Loop::Continue(restart_state))))
+    match restart_state.core.params.restart_strategy {
+        RestartStrategy::RestartImmediately => {
+            error!("restarting {} immediately", restart_state.core.params.name.as_ref());
+            Either::B(result(Ok(Loop::Continue(restart_state))))
+        },
+        RestartStrategy::Delay { restart_after, } => {
+            info!("restarting {} in {:?}", restart_state.core.params.name.as_ref(), restart_after);
+            let future = Delay::new(Instant::now() + restart_after)
+                .then(|_delay_result| Ok(Loop::Continue(restart_state)));
+            Either::A(future)
+        },
     }
 }
