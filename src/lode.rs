@@ -6,11 +6,11 @@ use std::{
 
 use futures::{
     future::{
-        Loop,
         loop_fn,
         result,
         Either,
     },
+    Sink,
     stream,
     Future,
     Stream,
@@ -31,6 +31,7 @@ use log::{
 use tokio::timer::Delay;
 
 use super::{
+    Loop,
     ErrorSeverity,
     RestartStrategy,
 };
@@ -74,13 +75,13 @@ pub fn spawn<FNI, FI, FNA, FA, FNR, FR, FNC, FC, N, S, R, P, Q>(
 )
     -> Lode<R>
 where FNI: FnMut(S) -> FI + Send + 'static,
-      FI: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S>> + 'static,
+      FI: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>> + 'static,
       FI::Future: Send,
       FNA: FnMut(P) -> FA + Send + 'static,
-      FA: IntoFuture<Item = (R, Resource<P, Q>), Error = ErrorSeverity<S>> + 'static,
+      FA: IntoFuture<Item = (R, Resource<P, Q>), Error = ErrorSeverity<S, ()>> + 'static,
       FA::Future: Send,
       FNR: FnMut(Resource<P, Q>, Option<R>) -> FR + Send + 'static,
-      FR: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S>> + 'static,
+      FR: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>> + 'static,
       FR::Future: Send,
       FNC: FnMut(Resource<P, Q>) -> FC + Send + 'static,
       FC: IntoFuture<Item = S, Error = ()> + Send + 'static,
@@ -146,11 +147,11 @@ fn restart_loop<FNI, FS, FNA, FA, FNR, FR, FNC, FC, N, S, R, P, Q>(
 )
     -> impl Future<Item = Loop<(), RestartState<FNI, FNA, FNR, FNC, N, S, R>>, Error = ()>
 where FNI: FnMut(S) -> FS + Send + 'static,
-      FS: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S>>,
+      FS: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>>,
       FNA: FnMut(P) -> FA,
-      FA: IntoFuture<Item = (R, Resource<P, Q>), Error = ErrorSeverity<S>>,
+      FA: IntoFuture<Item = (R, Resource<P, Q>), Error = ErrorSeverity<S, ()>>,
       FNR: FnMut(Resource<P, Q>, Option<R>) -> FR,
-      FR: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S>>,
+      FR: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>>,
       FNC: FnMut(Resource<P, Q>) -> FC,
       FC: IntoFuture<Item = S, Error = ()>,
       N: AsRef<str>,
@@ -207,7 +208,7 @@ where FNI: FnMut(S) -> FS + Send + 'static,
                                     });
                                     Either::B(Either::A(future))
                                 },
-                                Err(ErrorSeverity::Fatal) => {
+                                Err(ErrorSeverity::Fatal(())) => {
                                     error!("{} crashed with fatal error, terminating", core.params.name.as_ref());
                                     Either::B(Either::B(result(Err(()))))
                                 },
@@ -286,9 +287,9 @@ fn outer_loop<FNA, FA, FNR, FR, FNC, FC, N, S, R, P, Q>(
 )
     -> impl Future<Item = Loop<BreakOuter<FNA, FNR, FNC, N, S, R>, OuterState<FNA, FNR, FNC, N, R, P>>, Error = ()>
 where FNA: FnMut(P) -> FA,
-      FA: IntoFuture<Item = (R, Resource<P, Q>), Error = ErrorSeverity<S>>,
+      FA: IntoFuture<Item = (R, Resource<P, Q>), Error = ErrorSeverity<S, ()>>,
       FNR: FnMut(Resource<P, Q>, Option<R>) -> FR,
-      FR: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S>>,
+      FR: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>>,
       FNC: FnMut(Resource<P, Q>) -> FC,
       FC: IntoFuture<Item = S, Error = ()>,
       N: AsRef<str>,
@@ -344,9 +345,9 @@ fn main_loop<FNA, FA, FNR, FR, FNC, FC, N, S, R, P, Q>(
 )
     -> impl Future<Item = Loop<BreakMain<FNA, FNR, FNC, N, S, R, Q>, MainState<FNA, FNR, FNC, N, R, P>>, Error = ()>
 where FNA: FnMut(P) -> FA,
-      FA: IntoFuture<Item = (R, Resource<P, Q>), Error = ErrorSeverity<S>>,
+      FA: IntoFuture<Item = (R, Resource<P, Q>), Error = ErrorSeverity<S, ()>>,
       FNR: FnMut(Resource<P, Q>, Option<R>) -> FR,
-      FR: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S>>,
+      FR: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>>,
       FNC: FnMut(Resource<P, Q>) -> FC,
       FC: IntoFuture<Item = S, Error = ()>,
       N: AsRef<str>,
@@ -400,7 +401,7 @@ where FNA: FnMut(P) -> FA,
                             init_state,
                         })
                     },
-                    Err(ErrorSeverity::Fatal) => {
+                    Err(ErrorSeverity::Fatal(())) => {
                         error!("{} crashed with fatal error, terminating", params.name.as_ref());
                         Err(())
                     },
@@ -468,7 +469,7 @@ where FNA: FnMut(P) -> FA,
                                                         Ok(Loop::Break(BreakMain::WaitRelease { core, state_no_left, })),
                                                     Err(ErrorSeverity::Recoverable { state: init_state, }) =>
                                                         Ok(Loop::Break(BreakMain::RequireRestart { core, init_state, aquire_req_pending: None, })),
-                                                    Err(ErrorSeverity::Fatal) => {
+                                                    Err(ErrorSeverity::Fatal(())) => {
                                                         error!("{} crashed with fatal error, terminating", core.params.name.as_ref());
                                                         Err(())
                                                     },
@@ -549,9 +550,9 @@ fn wait_loop<FNA, FA, FNR, FR, FNC, FC, N, S, R, P, Q>(
 )
     -> impl Future<Item = Loop<BreakWait<FNA, FNR, FNC, N, S, R, P>, WaitState<FNA, FNR, FNC, N, R, Q>>, Error = ()>
 where FNA: FnMut(P) -> FA,
-      FA: IntoFuture<Item = (R, Resource<P, Q>), Error = ErrorSeverity<S>>,
+      FA: IntoFuture<Item = (R, Resource<P, Q>), Error = ErrorSeverity<S, ()>>,
       FNR: FnMut(Resource<P, Q>, Option<R>) -> FR,
-      FR: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S>>,
+      FR: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>>,
       FNC: FnMut(Resource<P, Q>) -> FC,
       FC: IntoFuture<Item = S, Error = ()>,
       N: AsRef<str>,
@@ -601,7 +602,7 @@ where FNA: FnMut(P) -> FA,
                                         },
                                     Err(ErrorSeverity::Recoverable { state: init_state, }) =>
                                         Either::A(result(Ok(Loop::Break(BreakWait::RequireRestart { core, init_state, })))),
-                                    Err(ErrorSeverity::Fatal) => {
+                                    Err(ErrorSeverity::Fatal(())) => {
                                         error!("{} crashed with fatal error, terminating", core.params.name.as_ref());
                                         Either::A(result(Err(())))
                                     },
@@ -664,5 +665,124 @@ where N: AsRef<str>,
                 .then(|_delay_result| Ok(Loop::Continue(restart_state)));
             Either::A(future)
         },
+    }
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub enum UsingError<E> {
+    ResourceTaskGone,
+    Fatal(E),
+}
+
+impl<R> Lode<R> {
+    pub fn shutdown(self) {
+        if let Err(..) = self.shutdown_tx.send(Shutdown) {
+            warn!("resource task is gone while performing shutdown");
+        }
+    }
+
+    pub fn steal_resource(self) -> impl Future<Item = (R, Lode<R>), Error = ()> {
+        let Lode { aquire_tx, release_tx, shutdown_tx, } = self;
+        let (resource_tx, resource_rx) = oneshot::channel();
+        aquire_tx
+            .send(AquireReq { reply_tx: resource_tx, })
+            .map_err(|_send_error| {
+                warn!("resource task is gone while aquiring resource");
+            })
+            .and_then(move |aquire_tx| {
+                resource_rx
+                    .map_err(|oneshot::Canceled| {
+                        warn!("resouce task is gone while receiving aquired resource");
+                    })
+                    .and_then(move |resource| {
+                        release_tx
+                            .send(ReleaseReq::ResourceLost)
+                            .map_err(|_send_error| {
+                                warn!("resource task is gone while releasing resource");
+                            })
+                            .map(move |release_tx| {
+                                (resource, Lode { aquire_tx, release_tx, shutdown_tx, })
+                            })
+                    })
+            })
+    }
+
+    pub fn using_resource<F, T, E, S, FI>(
+        self,
+        state: S,
+        using_fn: F,
+    )
+        -> impl Future<Item = (T, Lode<R>), Error = UsingError<E>>
+    where F: FnMut(R, S) -> FI,
+          FI: IntoFuture<Item = (Option<R>, Loop<T, S>), Error = ErrorSeverity<S, E>>
+    {
+        loop_fn(
+            (self, using_fn, state),
+            move |(Lode { aquire_tx, release_tx, shutdown_tx, }, mut using_fn, state)| {
+                let (resource_tx, resource_rx) = oneshot::channel();
+                aquire_tx
+                    .send(AquireReq { reply_tx: resource_tx, })
+                    .map_err(|_send_error| {
+                        warn!("resource task is gone while aquiring resource");
+                        UsingError::ResourceTaskGone
+                    })
+                    .and_then(move |aquire_tx| {
+                        resource_rx
+                            .map_err(|oneshot::Canceled| {
+                                warn!("resouce task is gone while receiving aquired resource");
+                                UsingError::ResourceTaskGone
+                            })
+                            .and_then(move |resource| {
+                                using_fn(resource, state)
+                                    .into_future()
+                                    .then(move |using_result| {
+                                        match using_result {
+                                            Ok((maybe_resource, loop_action)) => {
+                                                release_tx
+                                                    .unbounded_send(match maybe_resource {
+                                                        None =>
+                                                            ReleaseReq::ResourceLost,
+                                                        Some(resource) =>
+                                                            ReleaseReq::Reimburse(resource),
+                                                    })
+                                                    .map_err(|_send_error| {
+                                                        warn!("resource task is gone while releasing resource");
+                                                        UsingError::ResourceTaskGone
+                                                    })
+                                                    .map(move |()| {
+                                                        let lode = Lode { aquire_tx, release_tx, shutdown_tx, };
+                                                        match loop_action {
+                                                            Loop::Break(item) =>
+                                                                Loop::Break((item, lode)),
+                                                            Loop::Continue(state) =>
+                                                                Loop::Continue((lode, using_fn, state)),
+                                                        }
+                                                    })
+                                            },
+                                            Err(error) => {
+                                                release_tx
+                                                    .unbounded_send(ReleaseReq::ResourceFault)
+                                                    .map_err(|_send_error| {
+                                                        warn!("resource task is gone while releasing resource");
+                                                        UsingError::ResourceTaskGone
+                                                    })
+                                                    .and_then(move |()| {
+                                                        match error {
+                                                            ErrorSeverity::Recoverable { state, } =>
+                                                                Ok(Loop::Continue((
+                                                                    Lode { aquire_tx, release_tx, shutdown_tx, },
+                                                                    using_fn,
+                                                                    state,
+                                                                ))),
+                                                            ErrorSeverity::Fatal(fatal_error) =>
+                                                                Err(UsingError::Fatal(fatal_error)),
+                                                        }
+                                                    })
+                                            }
+                                        }
+                                    })
+                            })
+                    })
+            })
     }
 }

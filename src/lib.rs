@@ -1,9 +1,11 @@
 use std::time::Duration;
 
+pub use futures::future::Loop;
+
 pub mod lode;
 
-pub enum ErrorSeverity<S> {
-    Fatal,
+pub enum ErrorSeverity<S, A> {
+    Fatal(A),
     Recoverable { state: S, },
 }
 
