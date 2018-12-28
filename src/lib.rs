@@ -13,11 +13,3 @@ pub enum RestartStrategy {
     RestartImmediately,
     Delay { restart_after: Duration, },
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn it_works() {
-        assert_eq!(2 + 2, 4);
-    }
-}

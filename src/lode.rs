@@ -36,6 +36,9 @@ use super::{
     RestartStrategy,
 };
 
+#[cfg(test)]
+mod tests;
+
 struct AquireReq<R> {
     reply_tx: oneshot::Sender<R>,
 }
