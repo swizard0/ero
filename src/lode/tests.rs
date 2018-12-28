@@ -181,6 +181,79 @@ fn check_sequence() {
                         }
                     })
             })
+            .and_then(|(aquire_tx, release_tx, shutdown_tx, rx)| {
+                release_tx
+                    .send(super::ReleaseReq::ResourceFault)
+                    .then(|result| {
+                        if let Ok(release_tx) = result {
+                            Ok((aquire_tx, release_tx, shutdown_tx, rx))
+                        } else {
+                            panic!("release tx endpoint dropped unexpectedly");
+                        }
+                    })
+            })
+            .and_then(|(aquire_tx, release_tx, shutdown_tx, rx)| {
+                rx.into_future()
+                    .then(|result| {
+                        match result {
+                            Ok((Some(Notify::CloseFn), rx)) =>
+                                Ok((aquire_tx, release_tx, shutdown_tx, rx)),
+                            Ok((other, _rx)) =>
+                                panic!("expected tracking rx to be CloseFn but it is: {:?}", other),
+                            Err(..) =>
+                                panic!("expected tracking rx to be CloseFn"),
+                        }
+                    })
+            })
+            .and_then(|(aquire_tx, release_tx, shutdown_tx, rx)| {
+                let (resource_tx, resource_rx) = oneshot::channel();
+                aquire_tx
+                    .send(super::AquireReq { reply_tx: resource_tx, })
+                    .then(|result| {
+                        if let Ok(aquire_tx) = result {
+                            Ok((aquire_tx, release_tx, shutdown_tx, rx, resource_rx))
+                        } else {
+                            panic!("aquire tx endpoint dropped unexpectedly");
+                        }
+                    })
+            })
+            .and_then(|(aquire_tx, release_tx, shutdown_tx, rx, resource_rx)| {
+                rx.into_future()
+                    .then(|result| {
+                        match result {
+                            Ok((Some(Notify::InitFn), rx)) =>
+                                Ok((aquire_tx, release_tx, shutdown_tx, rx, resource_rx)),
+                            Ok((other, _rx)) =>
+                                panic!("expected tracking rx to be InitFn but it is: {:?}", other),
+                            Err(..) =>
+                                panic!("expected tracking rx to be InitFn"),
+                        }
+                    })
+            })
+            .and_then(|(aquire_tx, release_tx, shutdown_tx, rx, resource_rx)| {
+                rx.into_future()
+                    .then(|result| {
+                        match result {
+                            Ok((Some(Notify::AquireFn), rx)) =>
+                                Ok((aquire_tx, release_tx, shutdown_tx, rx, resource_rx)),
+                            Ok((other, _rx)) =>
+                                panic!("expected tracking rx to be AquireFn but it is: {:?}", other),
+                            Err(..) =>
+                                panic!("expected tracking rx to be AquireFn"),
+                        }
+                    })
+            })
+            .and_then(|(aquire_tx, release_tx, shutdown_tx, rx, resource_rx)| {
+                resource_rx
+                    .then(|result| {
+                        match result {
+                            Ok(ResourceItem) =>
+                                Ok((aquire_tx, release_tx, shutdown_tx, rx)),
+                            Err(..) =>
+                                panic!("expected resource but resource task is gone"),
+                        }
+                    })
+            })
             .and_then(move |(_aquire_tx, _release_tx, shutdown_tx, rx)| {
                 let _ = shutdown_tx.send(super::Shutdown);
                 rx.into_future()
