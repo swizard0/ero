@@ -674,6 +674,11 @@ pub enum UsingError<E> {
     Fatal(E),
 }
 
+pub enum UsingResource<R> {
+    Lost,
+    Reimburse(R),
+}
+
 impl<R> Lode<R> {
     pub fn shutdown(self) {
         if let Err(..) = self.shutdown_tx.send(Shutdown) {
@@ -707,14 +712,14 @@ impl<R> Lode<R> {
             })
     }
 
-    pub fn using_resource<F, T, E, S, FI>(
+    pub fn using_resource_loop<F, T, E, S, FI>(
         self,
         state: S,
         using_fn: F,
     )
         -> impl Future<Item = (T, Lode<R>), Error = UsingError<E>>
     where F: FnMut(R, S) -> FI,
-          FI: IntoFuture<Item = (Option<R>, Loop<T, S>), Error = ErrorSeverity<S, E>>
+          FI: IntoFuture<Item = (UsingResource<R>, Loop<T, S>), Error = ErrorSeverity<S, E>>
     {
         loop_fn(
             (self, using_fn, state),
@@ -740,9 +745,9 @@ impl<R> Lode<R> {
                                             Ok((maybe_resource, loop_action)) => {
                                                 release_tx
                                                     .unbounded_send(match maybe_resource {
-                                                        None =>
+                                                        UsingResource::Lost =>
                                                             ReleaseReq::ResourceLost,
-                                                        Some(resource) =>
+                                                        UsingResource::Reimburse(resource) =>
                                                             ReleaseReq::Reimburse(resource),
                                                     })
                                                     .map_err(|_send_error| {
