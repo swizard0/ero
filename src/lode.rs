@@ -820,4 +820,23 @@ impl<R> Lode<R> {
                     })
             })
     }
+
+    pub fn using_resource_once<F, T, E, S, FI>(
+        self,
+        state: S,
+        mut using_fn: F,
+    )
+        -> impl Future<Item = (T, Lode<R>), Error = UsingError<E>>
+    where F: FnMut(R, S) -> FI,
+          FI: IntoFuture<Item = (UsingResource<R>, T), Error = ErrorSeverity<S, E>>
+    {
+        self.using_resource_loop(
+            state,
+            move |resource, state| {
+                using_fn(resource, state)
+                    .into_future()
+                    .map(|(using_resource, value)| (using_resource, Loop::Break(value)))
+            },
+        )
+    }
 }
