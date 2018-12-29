@@ -40,10 +40,22 @@ use super::{
 mod tests;
 
 struct AquireReq<R> {
-    reply_tx: oneshot::Sender<R>,
+    reply_tx: oneshot::Sender<ResourceGen<R>>,
 }
 
-enum ReleaseReq<R> {
+type Generation = u64;
+
+struct ResourceGen<R> {
+    resource: R,
+    generation: Generation,
+}
+
+struct ReleaseReq<R> {
+    generation: Generation,
+    status: ResourceStatus<R>,
+}
+
+enum ResourceStatus<R> {
     Reimburse(R),
     ResourceLost,
     ResourceFault,
@@ -105,6 +117,7 @@ where FNI: FnMut(S) -> FI + Send + 'static,
                 aquire_rx: aquire_rx_stream.into_future(),
                 release_rx: release_rx_stream.into_future(),
                 aquires_count: 0,
+                generation: 0,
                 params,
                 aquire_fn,
                 release_fn,
@@ -150,6 +163,7 @@ struct Core<FNA, FNR, FNC, N, R> {
     release_fn: FNR,
     close_fn: FNC,
     aquires_count: usize,
+    generation: Generation,
 }
 
 struct RestartState<FNI, FNA, FNR, FNC, N, S, R> {
@@ -188,6 +202,7 @@ where FNI: FnMut(S) -> FS + Send + 'static,
                         .then(move |maybe_lode_state| {
                             match maybe_lode_state {
                                 Ok(Resource::Available(state_avail)) => {
+                                    core.generation += 1;
                                     let future =
                                         loop_fn(OuterState { core, state_avail, aquire_req_pending: Some(aquire_req), }, outer_loop)
                                         .then(move |inner_loop_result| {
@@ -249,7 +264,7 @@ fn wait_for_aquire<FNA, FNR, FNC, N, R>(
 )
     -> impl Future<Item = AquireWait<FNA, FNR, FNC, N, R>, Error = ()>
 {
-    let Core { aquire_rx, release_rx, params, aquire_fn, release_fn, close_fn, aquires_count, } = core;
+    let Core { aquire_rx, release_rx, params, aquire_fn, release_fn, close_fn, aquires_count, generation, } = core;
     aquire_rx
         .then(move |await_result| {
             match await_result {
@@ -259,7 +274,7 @@ fn wait_for_aquire<FNA, FNR, FNC, N, R>(
                         aquire_req,
                         core: Core {
                             aquire_rx: aquire_rx_stream.into_future(),
-                            release_rx, params, aquire_fn, release_fn, close_fn, aquires_count,
+                            release_rx, params, aquire_fn, release_fn, close_fn, aquires_count, generation,
                         },
                     })
                 },
@@ -361,7 +376,7 @@ where FNA: FnMut(P) -> FA,
       N: AsRef<str>,
 {
     let MainState {
-        core: Core { aquire_rx, release_rx, params, mut aquire_fn, release_fn, close_fn, aquires_count, },
+        core: Core { aquire_rx, release_rx, params, mut aquire_fn, release_fn, close_fn, aquires_count, generation, },
         state_avail,
         aquire_req_pending,
     } = main_state;
@@ -383,7 +398,7 @@ where FNA: FnMut(P) -> FA,
             .then(move |aquire_result| {
                 match aquire_result {
                     Ok((resource, resource_status)) => {
-                        let aquires_count = match reply_tx.send(resource) {
+                        let aquires_count = match reply_tx.send(ResourceGen { resource, generation, }) {
                             Ok(()) =>
                                 aquires_count + 1,
                             Err(_resource) => {
@@ -391,7 +406,7 @@ where FNA: FnMut(P) -> FA,
                                 aquires_count
                             },
                         };
-                        let core = Core { aquire_rx, release_rx, params, aquire_fn, release_fn, close_fn, aquires_count, };
+                        let core = Core { aquire_rx, release_rx, params, aquire_fn, release_fn, close_fn, aquires_count, generation, };
                         match resource_status {
                             Resource::Available(state_avail) =>
                                 Ok(AquireProcess::Proceed { core, state_avail, }),
@@ -403,7 +418,7 @@ where FNA: FnMut(P) -> FA,
                     Err(ErrorSeverity::Recoverable { state: init_state, }) => {
                         Ok(AquireProcess::RequireRestart {
                             core: Core {
-                                aquire_rx, release_rx, params, aquire_fn, release_fn, close_fn, aquires_count,
+                                aquire_rx, release_rx, params, aquire_fn, release_fn, close_fn, aquires_count, generation,
                             },
                             aquire_req_pending: Some(AquireReq { reply_tx, }),
                             init_state,
@@ -419,7 +434,7 @@ where FNA: FnMut(P) -> FA,
     } else {
         Either::B(result(Ok(AquireProcess::Proceed {
             core: Core {
-                aquire_rx, release_rx, params, aquire_fn, release_fn, close_fn, aquires_count,
+                aquire_rx, release_rx, params, aquire_fn, release_fn, close_fn, aquires_count, generation,
             },
             state_avail,
         })))
@@ -429,7 +444,7 @@ where FNA: FnMut(P) -> FA,
         .and_then(|aquire_process| {
             match aquire_process {
                 AquireProcess::Proceed { core, state_avail, } => {
-                    let Core { aquire_rx, release_rx, params, aquire_fn, mut release_fn, mut close_fn, aquires_count, } = core;
+                    let Core { aquire_rx, release_rx, params, aquire_fn, mut release_fn, mut close_fn, aquires_count, generation, } = core;
                     let future = aquire_rx
                         .select2(release_rx)
                         .then(move |await_result| {
@@ -439,7 +454,7 @@ where FNA: FnMut(P) -> FA,
                                     Either::B(result(Ok(Loop::Continue(MainState {
                                         core: Core {
                                             aquire_rx: aquire_rx_stream.into_future(),
-                                            release_rx, params, aquire_fn, release_fn, close_fn, aquires_count,
+                                            release_rx, params, aquire_fn, release_fn, close_fn, aquires_count, generation,
                                         },
                                         state_avail,
                                         aquire_req_pending: Some(aquire_req),
@@ -450,58 +465,70 @@ where FNA: FnMut(P) -> FA,
                                     Either::B(result(Ok(Loop::Break(BreakMain::Shutdown))))
                                 },
                                 Ok(Either::B(((Some(release_req), release_rx_stream), aquire_rx))) => {
-                                    debug!("main_loop: release request");
-                                    let maybe_resource = match release_req {
-                                        ReleaseReq::Reimburse(resource) =>
-                                            Some(Some(resource)),
-                                        ReleaseReq::ResourceLost =>
-                                            Some(None),
-                                        ReleaseReq::ResourceFault =>
-                                            None,
-                                    };
-                                    let future = if let Some(released_resource) = maybe_resource {
-                                        // resource is actually released
-                                        let future = release_fn(Resource::Available(state_avail), released_resource)
-                                            .into_future()
-                                            .then(move |release_result| {
-                                                let core = Core {
-                                                    release_rx: release_rx_stream.into_future(),
-                                                    aquires_count: if aquires_count > 0 { aquires_count - 1 } else { 0 },
-                                                    aquire_rx, params, aquire_fn, release_fn, close_fn,
-                                                };
-                                                match release_result {
-                                                    Ok(Resource::Available(state_avail)) =>
-                                                        Ok(Loop::Continue(MainState { core, state_avail, aquire_req_pending: None, })),
-                                                    Ok(Resource::OutOfStock(state_no_left)) =>
-                                                        Ok(Loop::Break(BreakMain::WaitRelease { core, state_no_left, })),
-                                                    Err(ErrorSeverity::Recoverable { state: init_state, }) =>
-                                                        Ok(Loop::Break(BreakMain::RequireRestart { core, init_state, aquire_req_pending: None, })),
-                                                    Err(ErrorSeverity::Fatal(())) => {
-                                                        error!("{} crashed with fatal error, terminating", core.params.name.as_ref());
-                                                        Err(())
-                                                    },
-                                                }
-                                            });
-                                        Either::A(future)
-                                    } else {
-                                        // something wrong with resource, schedule restart
-                                        warn!("resource fault report: performing restart");
-                                        let future = close_fn(Resource::Available(state_avail))
-                                            .into_future()
-                                            .map(move |init_state| {
-                                                Loop::Break(BreakMain::RequireRestart {
-                                                    core: Core {
+                                    if release_req.generation == generation {
+                                        debug!("main_loop: release request");
+                                        let maybe_resource = match release_req.status {
+                                            ResourceStatus::Reimburse(resource) =>
+                                                Some(Some(resource)),
+                                            ResourceStatus::ResourceLost =>
+                                                Some(None),
+                                            ResourceStatus::ResourceFault =>
+                                                None,
+                                        };
+                                        let future = if let Some(released_resource) = maybe_resource {
+                                            // resource is actually released
+                                            let future = release_fn(Resource::Available(state_avail), released_resource)
+                                                .into_future()
+                                                .then(move |release_result| {
+                                                    let core = Core {
                                                         release_rx: release_rx_stream.into_future(),
                                                         aquires_count: if aquires_count > 0 { aquires_count - 1 } else { 0 },
-                                                        aquire_rx, params, aquire_fn, release_fn, close_fn,
-                                                    },
-                                                    init_state,
-                                                    aquire_req_pending: None,
-                                                })
-                                            });
-                                        Either::B(future)
-                                    };
-                                    Either::A(future)
+                                                        aquire_rx, params, aquire_fn, release_fn, close_fn, generation,
+                                                    };
+                                                    match release_result {
+                                                        Ok(Resource::Available(state_avail)) =>
+                                                            Ok(Loop::Continue(MainState { core, state_avail, aquire_req_pending: None, })),
+                                                        Ok(Resource::OutOfStock(state_no_left)) =>
+                                                            Ok(Loop::Break(BreakMain::WaitRelease { core, state_no_left, })),
+                                                        Err(ErrorSeverity::Recoverable { state: init_state, }) =>
+                                                            Ok(Loop::Break(BreakMain::RequireRestart { core, init_state, aquire_req_pending: None, })),
+                                                        Err(ErrorSeverity::Fatal(())) => {
+                                                            error!("{} crashed with fatal error, terminating", core.params.name.as_ref());
+                                                            Err(())
+                                                        },
+                                                    }
+                                                });
+                                            Either::A(future)
+                                        } else {
+                                            // something wrong with resource, schedule restart
+                                            warn!("resource fault report: performing restart");
+                                            let future = close_fn(Resource::Available(state_avail))
+                                                .into_future()
+                                                .map(move |init_state| {
+                                                    Loop::Break(BreakMain::RequireRestart {
+                                                        core: Core {
+                                                            release_rx: release_rx_stream.into_future(),
+                                                            aquires_count: if aquires_count > 0 { aquires_count - 1 } else { 0 },
+                                                            aquire_rx, params, aquire_fn, release_fn, close_fn, generation,
+                                                        },
+                                                        init_state,
+                                                        aquire_req_pending: None,
+                                                    })
+                                                });
+                                            Either::B(future)
+                                        };
+                                        Either::A(future)
+                                    } else {
+                                        debug!("main_loop: skipping obsolete release request");
+                                        Either::B(result(Ok(Loop::Continue(MainState {
+                                            core: Core {
+                                                release_rx: release_rx_stream.into_future(),
+                                                aquire_rx, params, aquire_fn, release_fn, close_fn, aquires_count, generation,
+                                            },
+                                            state_avail,
+                                            aquire_req_pending: None,
+                                        }))))
+                                    }
                                 },
                                 Ok(Either::B(((None, _release_rx_stream), _aquire_rx))) => {
                                     debug!("main_loop: release channel depleted");
@@ -557,74 +584,84 @@ where FNA: FnMut(P) -> FA,
       N: AsRef<str>,
 {
     let WaitState {
-        core: Core { aquire_rx, release_rx, params, aquire_fn, mut release_fn, mut close_fn, aquires_count, },
+        core: Core { aquire_rx, release_rx, params, aquire_fn, mut release_fn, mut close_fn, aquires_count, generation, },
         state_no_left,
     } = wait_state;
 
     release_rx
         .then(move |await_result| {
             match await_result {
-                Ok((Some(release_req), release_rx_stream)) => {
-                    let maybe_resource = match release_req {
-                        ReleaseReq::Reimburse(resource) =>
-                            Some(Some(resource)),
-                        ReleaseReq::ResourceLost =>
-                            Some(None),
-                        ReleaseReq::ResourceFault =>
-                            None,
-                    };
-                    let future = if let Some(released_resource) = maybe_resource {
-                        // resource is actually released
-                        let future = release_fn(Resource::OutOfStock(state_no_left), released_resource)
-                            .into_future()
-                            .then(move |release_result| {
-                                let mut core = Core {
-                                    release_rx: release_rx_stream.into_future(),
-                                    aquires_count: if aquires_count > 0 { aquires_count - 1 } else { 0 },
-                                    aquire_rx, params, aquire_fn, release_fn, close_fn,
-                                };
-                                match release_result {
-                                    Ok(Resource::Available(state_avail)) =>
-                                        Either::A(result(Ok(Loop::Break(BreakWait::ProceedMain { core, state_avail, })))),
-                                    Ok(Resource::OutOfStock(state_no_left)) =>
-                                        if aquires_count > 0 {
-                                            Either::A(result(Ok(Loop::Continue(WaitState { core, state_no_left, }))))
-                                        } else {
-                                            info!("{} runs out of resources, performing restart", core.params.name.as_ref());
-                                            let future = (core.close_fn)(Resource::OutOfStock(state_no_left))
-                                                .into_future()
-                                                .map(move |init_state| {
-                                                    Loop::Break(BreakWait::RequireRestart { core, init_state, })
-                                                });
-                                            Either::B(future)
-                                        },
-                                    Err(ErrorSeverity::Recoverable { state: init_state, }) =>
-                                        Either::A(result(Ok(Loop::Break(BreakWait::RequireRestart { core, init_state, })))),
-                                    Err(ErrorSeverity::Fatal(())) => {
-                                        error!("{} crashed with fatal error, terminating", core.params.name.as_ref());
-                                        Either::A(result(Err(())))
-                                    },
-                                }
-                            });
-                        Either::A(future)
-                    } else {
-                        // something wrong with resource, schedule restart
-                        warn!("resource fault report: performing restart");
-                        let future = close_fn(Resource::OutOfStock(state_no_left))
-                            .into_future()
-                            .map(move |init_state| {
-                                Loop::Break(BreakWait::RequireRestart {
-                                    core: Core {
+                Ok((Some(ReleaseReq { generation: release_gen, status, }), release_rx_stream)) => {
+                    if release_gen == generation {
+                        debug!("wait_loop: release request");
+                        let maybe_resource = match status {
+                            ResourceStatus::Reimburse(resource) =>
+                                Some(Some(resource)),
+                            ResourceStatus::ResourceLost =>
+                                Some(None),
+                            ResourceStatus::ResourceFault =>
+                                None,
+                        };
+                        let future = if let Some(released_resource) = maybe_resource {
+                            // resource is actually released
+                            let future = release_fn(Resource::OutOfStock(state_no_left), released_resource)
+                                .into_future()
+                                .then(move |release_result| {
+                                    let mut core = Core {
                                         release_rx: release_rx_stream.into_future(),
                                         aquires_count: if aquires_count > 0 { aquires_count - 1 } else { 0 },
-                                        aquire_rx, params, aquire_fn, release_fn, close_fn,
-                                    },
-                                    init_state,
-                                })
-                            });
-                        Either::B(future)
-                    };
-                    Either::A(future)
+                                        aquire_rx, params, aquire_fn, release_fn, close_fn, generation,
+                                    };
+                                    match release_result {
+                                        Ok(Resource::Available(state_avail)) =>
+                                            Either::A(result(Ok(Loop::Break(BreakWait::ProceedMain { core, state_avail, })))),
+                                        Ok(Resource::OutOfStock(state_no_left)) =>
+                                            if aquires_count > 0 {
+                                                Either::A(result(Ok(Loop::Continue(WaitState { core, state_no_left, }))))
+                                            } else {
+                                                info!("{} runs out of resources, performing restart", core.params.name.as_ref());
+                                                let future = (core.close_fn)(Resource::OutOfStock(state_no_left))
+                                                    .into_future()
+                                                    .map(move |init_state| {
+                                                        Loop::Break(BreakWait::RequireRestart { core, init_state, })
+                                                    });
+                                                Either::B(future)
+                                            },
+                                        Err(ErrorSeverity::Recoverable { state: init_state, }) =>
+                                            Either::A(result(Ok(Loop::Break(BreakWait::RequireRestart { core, init_state, })))),
+                                        Err(ErrorSeverity::Fatal(())) => {
+                                            error!("{} crashed with fatal error, terminating", core.params.name.as_ref());
+                                            Either::A(result(Err(())))
+                                        },
+                                    }
+                                });
+                            Either::A(future)
+                        } else {
+                            // something wrong with resource, schedule restart
+                            warn!("resource fault report: performing restart");
+                            let future = close_fn(Resource::OutOfStock(state_no_left))
+                                .into_future()
+                                .map(move |init_state| {
+                                    Loop::Break(BreakWait::RequireRestart {
+                                        core: Core {
+                                            release_rx: release_rx_stream.into_future(),
+                                            aquires_count: if aquires_count > 0 { aquires_count - 1 } else { 0 },
+                                            aquire_rx, params, aquire_fn, release_fn, close_fn, generation,
+                                        },
+                                        init_state,
+                                    })
+                                });
+                            Either::B(future)
+                        };
+                        Either::A(future)
+                    } else {
+                        debug!("wait_loop: skipping obsolete release request");
+                        let core = Core {
+                            release_rx: release_rx_stream.into_future(),
+                            aquire_rx, params, aquire_fn, release_fn, close_fn, aquires_count, generation,
+                        };
+                        Either::B(result(Ok(Loop::Continue(WaitState { core, state_no_left, }))))
+                    }
                 },
                 Ok((None, _release_rx_stream)) => {
                     debug!("wait_loop: release channel depleted");
@@ -689,9 +726,9 @@ impl<R> Lode<R> {
                     .map_err(|oneshot::Canceled| {
                         warn!("resouce task is gone while receiving aquired resource");
                     })
-                    .and_then(move |resource| {
+                    .and_then(move |ResourceGen { resource, generation, }| {
                         release_tx
-                            .send(ReleaseReq::ResourceLost)
+                            .send(ReleaseReq { generation, status: ResourceStatus::ResourceLost, })
                             .map_err(|_send_error| {
                                 warn!("resource task is gone while releasing resource");
                             })
@@ -727,18 +764,21 @@ impl<R> Lode<R> {
                                 warn!("resouce task is gone while receiving aquired resource");
                                 UsingError::ResourceTaskGone
                             })
-                            .and_then(move |resource| {
+                            .and_then(move |ResourceGen { resource, generation, }| {
                                 using_fn(resource, state)
                                     .into_future()
                                     .then(move |using_result| {
                                         match using_result {
                                             Ok((maybe_resource, loop_action)) => {
                                                 release_tx
-                                                    .unbounded_send(match maybe_resource {
-                                                        UsingResource::Lost =>
-                                                            ReleaseReq::ResourceLost,
-                                                        UsingResource::Reimburse(resource) =>
-                                                            ReleaseReq::Reimburse(resource),
+                                                    .unbounded_send(ReleaseReq {
+                                                        generation,
+                                                        status: match maybe_resource {
+                                                            UsingResource::Lost =>
+                                                                ResourceStatus::ResourceLost,
+                                                            UsingResource::Reimburse(resource) =>
+                                                                ResourceStatus::Reimburse(resource),
+                                                        },
                                                     })
                                                     .map_err(|_send_error| {
                                                         warn!("resource task is gone while releasing resource");
@@ -756,7 +796,7 @@ impl<R> Lode<R> {
                                             },
                                             Err(error) => {
                                                 release_tx
-                                                    .unbounded_send(ReleaseReq::ResourceFault)
+                                                    .unbounded_send(ReleaseReq { generation, status: ResourceStatus::ResourceFault, })
                                                     .map_err(|_send_error| {
                                                         warn!("resource task is gone while releasing resource");
                                                         UsingError::ResourceTaskGone

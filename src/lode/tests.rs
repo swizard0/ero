@@ -114,8 +114,10 @@ fn check_sequence() {
                 resource_rx
                     .then(|result| {
                         match result {
-                            Ok(ResourceItem) =>
+                            Ok(super::ResourceGen { generation: 1, resource: ResourceItem, }) =>
                                 Ok((aquire_tx, release_tx, shutdown_tx, rx)),
+                            Ok(super::ResourceGen { generation, resource: ResourceItem, }) =>
+                                panic!("expected resource generation 1 but got {}", generation),
                             Err(..) =>
                                 panic!("expected resource but resource task is gone"),
                         }
@@ -123,7 +125,7 @@ fn check_sequence() {
             })
             .and_then(|(aquire_tx, release_tx, shutdown_tx, rx)| {
                 release_tx
-                    .send(super::ReleaseReq::Reimburse(ResourceItem))
+                    .send(super::ReleaseReq { generation: 1, status: super::ResourceStatus::Reimburse(ResourceItem), })
                     .then(|result| {
                         if let Ok(release_tx) = result {
                             Ok((aquire_tx, release_tx, shutdown_tx, rx))
@@ -174,8 +176,10 @@ fn check_sequence() {
                 resource_rx
                     .then(|result| {
                         match result {
-                            Ok(ResourceItem) =>
+                            Ok(super::ResourceGen { generation: 1, resource: ResourceItem, }) =>
                                 Ok((aquire_tx, release_tx, shutdown_tx, rx)),
+                            Ok(super::ResourceGen { generation, resource: ResourceItem, }) =>
+                                panic!("expected resource generation 1 but got {}", generation),
                             Err(..) =>
                                 panic!("expected resource but resource task is gone"),
                         }
@@ -183,7 +187,7 @@ fn check_sequence() {
             })
             .and_then(|(aquire_tx, release_tx, shutdown_tx, rx)| {
                 release_tx
-                    .send(super::ReleaseReq::ResourceFault)
+                    .send(super::ReleaseReq { generation: 1, status: super::ResourceStatus::ResourceFault, })
                     .then(|result| {
                         if let Ok(release_tx) = result {
                             Ok((aquire_tx, release_tx, shutdown_tx, rx))
@@ -247,10 +251,23 @@ fn check_sequence() {
                 resource_rx
                     .then(|result| {
                         match result {
-                            Ok(ResourceItem) =>
+                            Ok(super::ResourceGen { generation: 2, resource: ResourceItem, }) =>
                                 Ok((aquire_tx, release_tx, shutdown_tx, rx)),
+                            Ok(super::ResourceGen { generation, resource: ResourceItem, }) =>
+                                panic!("expected resource generation 2 but got {}", generation),
                             Err(..) =>
                                 panic!("expected resource but resource task is gone"),
+                        }
+                    })
+            })
+            .and_then(|(aquire_tx, release_tx, shutdown_tx, rx)| {
+                release_tx
+                    .send(super::ReleaseReq { generation: 1, status: super::ResourceStatus::ResourceLost, })
+                    .then(|result| {
+                        if let Ok(release_tx) = result {
+                            Ok((aquire_tx, release_tx, shutdown_tx, rx))
+                        } else {
+                            panic!("release tx endpoint dropped unexpectedly");
                         }
                     })
             })
