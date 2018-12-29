@@ -99,25 +99,40 @@ where FNI: FnMut(S) -> FI + Send + 'static,
     let (release_tx_stream, release_rx_stream) = mpsc::unbounded();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-    executor.spawn(
-        loop_fn(
-            RestartState {
-                core: Core {
-                    aquire_rx: aquire_rx_stream.into_future(),
-                    release_rx: release_rx_stream.into_future(),
-                    aquires_count: 0,
-                    shutdown_rx,
-                    params,
-                    aquire_fn,
-                    release_fn,
-                    close_fn,
-                },
-                aquire_req_pending: None,
-                init_state,
-                init_fn,
+    let task_future = loop_fn(
+        RestartState {
+            core: Core {
+                aquire_rx: aquire_rx_stream.into_future(),
+                release_rx: release_rx_stream.into_future(),
+                aquires_count: 0,
+                params,
+                aquire_fn,
+                release_fn,
+                close_fn,
             },
-            restart_loop,
-        )
+            aquire_req_pending: None,
+            init_state,
+            init_fn,
+        },
+        restart_loop,
+    );
+    executor.spawn(
+        task_future
+            .select2(shutdown_rx)
+            .then(|result| {
+                match result {
+                    Ok(Either::A(((), _shutdown_rx))) =>
+                        Ok(()),
+                    Ok(Either::B((Shutdown, _task_future))) =>
+                        Ok(()),
+                    Err(Either::A(((), _shutdown_rx))) =>
+                        Err(()),
+                    Err(Either::B((oneshot::Canceled, _task_future))) => {
+                        debug!("shutdown channel outer endpoint dropped");
+                        Err(())
+                    },
+                }
+            })
     );
 
     Lode {
@@ -130,7 +145,6 @@ where FNI: FnMut(S) -> FI + Send + 'static,
 struct Core<FNA, FNR, FNC, N, R> {
     aquire_rx: stream::StreamFuture<mpsc::Receiver<AquireReq<R>>>,
     release_rx: stream::StreamFuture<mpsc::UnboundedReceiver<ReleaseReq<R>>>,
-    shutdown_rx: oneshot::Receiver<Shutdown>,
     params: Params<N>,
     aquire_fn: FNA,
     release_fn: FNR,
@@ -235,35 +249,26 @@ fn wait_for_aquire<FNA, FNR, FNC, N, R>(
 )
     -> impl Future<Item = AquireWait<FNA, FNR, FNC, N, R>, Error = ()>
 {
-    let Core { aquire_rx, release_rx, shutdown_rx, params, aquire_fn, release_fn, close_fn, aquires_count, } = core;
+    let Core { aquire_rx, release_rx, params, aquire_fn, release_fn, close_fn, aquires_count, } = core;
     aquire_rx
-        .select2(shutdown_rx)
         .then(move |await_result| {
             match await_result {
-                Ok(Either::A(((Some(aquire_req), aquire_rx_stream), shutdown_rx))) => {
+                Ok((Some(aquire_req), aquire_rx_stream)) => {
                     debug!("wait_for_aquire: aquire request");
                     Ok(AquireWait::Arrived {
                         aquire_req,
                         core: Core {
                             aquire_rx: aquire_rx_stream.into_future(),
-                            release_rx, shutdown_rx, params, aquire_fn, release_fn, close_fn, aquires_count,
+                            release_rx, params, aquire_fn, release_fn, close_fn, aquires_count,
                         },
                     })
                 },
-                Ok(Either::A(((None, _aquire_rx_stream), _shutdown_rx))) => {
+                Ok((None, _aquire_rx_stream)) => {
                     debug!("wait_for_aquire: release channel depleted");
                     Ok(AquireWait::Shutdown)
                 },
-                Ok(Either::B((Shutdown, _aquire_rx))) => {
-                    debug!("wait_for_aquire: shutdown request");
-                    Ok(AquireWait::Shutdown)
-                },
-                Err(Either::A((((), _aquire_rx_stream), _shutdown_rx))) => {
+                Err(((), _aquire_rx_stream)) => {
                     debug!("wait_for_aquire: aquire channel outer endpoint dropped");
-                    Ok(AquireWait::Shutdown)
-                },
-                Err(Either::B((oneshot::Canceled, _aquire_rx))) => {
-                    debug!("wait_for_aquire: shutdown channel outer endpoint dropped");
                     Ok(AquireWait::Shutdown)
                 },
             }
@@ -356,7 +361,7 @@ where FNA: FnMut(P) -> FA,
       N: AsRef<str>,
 {
     let MainState {
-        core: Core { aquire_rx, release_rx, shutdown_rx, params, mut aquire_fn, release_fn, close_fn, aquires_count, },
+        core: Core { aquire_rx, release_rx, params, mut aquire_fn, release_fn, close_fn, aquires_count, },
         state_avail,
         aquire_req_pending,
     } = main_state;
@@ -386,7 +391,7 @@ where FNA: FnMut(P) -> FA,
                                 aquires_count
                             },
                         };
-                        let core = Core { aquire_rx, release_rx, shutdown_rx, params, aquire_fn, release_fn, close_fn, aquires_count, };
+                        let core = Core { aquire_rx, release_rx, params, aquire_fn, release_fn, close_fn, aquires_count, };
                         match resource_status {
                             Resource::Available(state_avail) =>
                                 Ok(AquireProcess::Proceed { core, state_avail, }),
@@ -398,7 +403,7 @@ where FNA: FnMut(P) -> FA,
                     Err(ErrorSeverity::Recoverable { state: init_state, }) => {
                         Ok(AquireProcess::RequireRestart {
                             core: Core {
-                                aquire_rx, release_rx, shutdown_rx, params, aquire_fn, release_fn, close_fn, aquires_count,
+                                aquire_rx, release_rx, params, aquire_fn, release_fn, close_fn, aquires_count,
                             },
                             aquire_req_pending: Some(AquireReq { reply_tx, }),
                             init_state,
@@ -414,7 +419,7 @@ where FNA: FnMut(P) -> FA,
     } else {
         Either::B(result(Ok(AquireProcess::Proceed {
             core: Core {
-                aquire_rx, release_rx, shutdown_rx, params, aquire_fn, release_fn, close_fn, aquires_count,
+                aquire_rx, release_rx, params, aquire_fn, release_fn, close_fn, aquires_count,
             },
             state_avail,
         })))
@@ -424,28 +429,27 @@ where FNA: FnMut(P) -> FA,
         .and_then(|aquire_process| {
             match aquire_process {
                 AquireProcess::Proceed { core, state_avail, } => {
-                    let Core { aquire_rx, release_rx, shutdown_rx, params, aquire_fn, mut release_fn, mut close_fn, aquires_count, } = core;
+                    let Core { aquire_rx, release_rx, params, aquire_fn, mut release_fn, mut close_fn, aquires_count, } = core;
                     let future = aquire_rx
                         .select2(release_rx)
-                        .select2(shutdown_rx)
                         .then(move |await_result| {
                             match await_result {
-                                Ok(Either::A((Either::A(((Some(aquire_req), aquire_rx_stream), release_rx)), shutdown_rx))) => {
+                                Ok(Either::A(((Some(aquire_req), aquire_rx_stream), release_rx))) => {
                                     debug!("main_loop: aquire request");
                                     Either::B(result(Ok(Loop::Continue(MainState {
                                         core: Core {
                                             aquire_rx: aquire_rx_stream.into_future(),
-                                            release_rx, shutdown_rx, params, aquire_fn, release_fn, close_fn, aquires_count,
+                                            release_rx, params, aquire_fn, release_fn, close_fn, aquires_count,
                                         },
                                         state_avail,
                                         aquire_req_pending: Some(aquire_req),
                                     }))))
                                 },
-                                Ok(Either::A((Either::A(((None, _aquire_rx_stream), _release_rx)), _shutdown_rx))) => {
+                                Ok(Either::A(((None, _aquire_rx_stream), _release_rx))) => {
                                     debug!("main_loop: aquire channel depleted");
                                     Either::B(result(Ok(Loop::Break(BreakMain::Shutdown))))
                                 },
-                                Ok(Either::A((Either::B(((Some(release_req), release_rx_stream), aquire_rx)), shutdown_rx))) => {
+                                Ok(Either::B(((Some(release_req), release_rx_stream), aquire_rx))) => {
                                     debug!("main_loop: release request");
                                     let maybe_resource = match release_req {
                                         ReleaseReq::Reimburse(resource) =>
@@ -463,7 +467,7 @@ where FNA: FnMut(P) -> FA,
                                                 let core = Core {
                                                     release_rx: release_rx_stream.into_future(),
                                                     aquires_count: if aquires_count > 0 { aquires_count - 1 } else { 0 },
-                                                    aquire_rx, shutdown_rx, params, aquire_fn, release_fn, close_fn,
+                                                    aquire_rx, params, aquire_fn, release_fn, close_fn,
                                                 };
                                                 match release_result {
                                                     Ok(Resource::Available(state_avail)) =>
@@ -489,7 +493,7 @@ where FNA: FnMut(P) -> FA,
                                                     core: Core {
                                                         release_rx: release_rx_stream.into_future(),
                                                         aquires_count: if aquires_count > 0 { aquires_count - 1 } else { 0 },
-                                                        aquire_rx, shutdown_rx, params, aquire_fn, release_fn, close_fn,
+                                                        aquire_rx, params, aquire_fn, release_fn, close_fn,
                                                     },
                                                     init_state,
                                                     aquire_req_pending: None,
@@ -499,24 +503,16 @@ where FNA: FnMut(P) -> FA,
                                     };
                                     Either::A(future)
                                 },
-                                Ok(Either::A((Either::B(((None, _release_rx_stream), _aquire_rx)), _shutdown_rx))) => {
+                                Ok(Either::B(((None, _release_rx_stream), _aquire_rx))) => {
                                     debug!("main_loop: release channel depleted");
                                     Either::B(result(Ok(Loop::Break(BreakMain::Shutdown))))
                                 },
-                                Ok(Either::B((Shutdown, _aquire_release_rxs))) => {
-                                    debug!("main_loop: shutdown request");
-                                    Either::B(result(Ok(Loop::Break(BreakMain::Shutdown))))
-                                },
-                                Err(Either::A((Either::A((((), _aquire_rx), _release_rx)), _shutdown_rx))) => {
+                                Err(Either::A((((), _aquire_rx), _release_rx))) => {
                                     debug!("main_loop: aquire channel outer endpoint dropped");
                                     Either::B(result(Ok(Loop::Break(BreakMain::Shutdown))))
                                 },
-                                Err(Either::A((Either::B((((), _release_rx), _aquire_rx)), _shutdown_rx))) => {
+                                Err(Either::B((((), _release_rx), _aquire_rx))) => {
                                     debug!("main_loop: release channel outer endpoint dropped");
-                                    Either::B(result(Ok(Loop::Break(BreakMain::Shutdown))))
-                                },
-                                Err(Either::B((oneshot::Canceled, _aquire_release_rxs))) => {
-                                    debug!("main_loop: shutdown channel outer endpoint dropped");
                                     Either::B(result(Ok(Loop::Break(BreakMain::Shutdown))))
                                 },
                             }
@@ -561,15 +557,14 @@ where FNA: FnMut(P) -> FA,
       N: AsRef<str>,
 {
     let WaitState {
-        core: Core { aquire_rx, release_rx, shutdown_rx, params, aquire_fn, mut release_fn, mut close_fn, aquires_count, },
+        core: Core { aquire_rx, release_rx, params, aquire_fn, mut release_fn, mut close_fn, aquires_count, },
         state_no_left,
     } = wait_state;
 
     release_rx
-        .select2(shutdown_rx)
         .then(move |await_result| {
             match await_result {
-                Ok(Either::A(((Some(release_req), release_rx_stream), shutdown_rx))) => {
+                Ok((Some(release_req), release_rx_stream)) => {
                     let maybe_resource = match release_req {
                         ReleaseReq::Reimburse(resource) =>
                             Some(Some(resource)),
@@ -586,7 +581,7 @@ where FNA: FnMut(P) -> FA,
                                 let mut core = Core {
                                     release_rx: release_rx_stream.into_future(),
                                     aquires_count: if aquires_count > 0 { aquires_count - 1 } else { 0 },
-                                    aquire_rx, shutdown_rx, params, aquire_fn, release_fn, close_fn,
+                                    aquire_rx, params, aquire_fn, release_fn, close_fn,
                                 };
                                 match release_result {
                                     Ok(Resource::Available(state_avail)) =>
@@ -622,7 +617,7 @@ where FNA: FnMut(P) -> FA,
                                     core: Core {
                                         release_rx: release_rx_stream.into_future(),
                                         aquires_count: if aquires_count > 0 { aquires_count - 1 } else { 0 },
-                                        aquire_rx, shutdown_rx, params, aquire_fn, release_fn, close_fn,
+                                        aquire_rx, params, aquire_fn, release_fn, close_fn,
                                     },
                                     init_state,
                                 })
@@ -631,20 +626,12 @@ where FNA: FnMut(P) -> FA,
                     };
                     Either::A(future)
                 },
-                Ok(Either::A(((None, _release_rx_stream), _shutdown_rx))) => {
+                Ok((None, _release_rx_stream)) => {
                     debug!("wait_loop: release channel depleted");
                     Either::B(result(Ok(Loop::Break(BreakWait::Shutdown))))
                 },
-                Ok(Either::B((Shutdown, _release_rx))) => {
-                    debug!("wait_loop: shutdown request");
-                    Either::B(result(Ok(Loop::Break(BreakWait::Shutdown))))
-                },
-                Err(Either::A((((), _release_rx_stream), _shutdown_rx))) => {
+                Err(((), _release_rx_stream)) => {
                     debug!("wait_loop: release channel outer endpoint dropped");
-                    Either::B(result(Ok(Loop::Break(BreakWait::Shutdown))))
-                },
-                Err(Either::B((oneshot::Canceled, _release_rx))) => {
-                    debug!("wait_loop: shutdown channel outer endpoint dropped");
                     Either::B(result(Ok(Loop::Break(BreakWait::Shutdown))))
                 },
             }
