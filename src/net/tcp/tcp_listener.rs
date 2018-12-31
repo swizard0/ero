@@ -28,8 +28,8 @@ use super::super::super::{
 };
 
 pub struct Params<N> {
-    sock_addr: SocketAddr,
-    lode_params: lode::Params<N>,
+    pub sock_addr: SocketAddr,
+    pub lode_params: lode::Params<N>,
 }
 
 pub fn spawn<N>(
