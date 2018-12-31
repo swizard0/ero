@@ -75,8 +75,8 @@ pub enum Resource<P, Q> {
 }
 
 pub struct Params<N> {
-    name: N,
-    restart_strategy: RestartStrategy,
+    pub name: N,
+    pub restart_strategy: RestartStrategy,
 }
 
 pub fn spawn<FNI, FI, FNA, FA, FNR, FR, FNC, FC, N, S, R, P, Q>(
