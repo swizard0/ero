@@ -466,14 +466,19 @@ where FNA: FnMut(P) -> FA,
                                 },
                                 Ok(Either::B(((Some(release_req), release_rx_stream), aquire_rx))) => {
                                     if release_req.generation == generation {
-                                        debug!("main_loop: release request");
                                         let maybe_resource = match release_req.status {
-                                            ResourceStatus::Reimburse(resource) =>
-                                                Some(Some(resource)),
-                                            ResourceStatus::ResourceLost =>
-                                                Some(None),
-                                            ResourceStatus::ResourceFault =>
-                                                None,
+                                            ResourceStatus::Reimburse(resource) => {
+                                                debug!("main_loop: release request (resource reimbursed)");
+                                                Some(Some(resource))
+                                            },
+                                            ResourceStatus::ResourceLost => {
+                                                debug!("main_loop: release request (resource lost)");
+                                                Some(None)
+                                            },
+                                            ResourceStatus::ResourceFault => {
+                                                debug!("main_loop: release request (resource fault)");
+                                                None
+                                            },
                                         };
                                         let future = if let Some(released_resource) = maybe_resource {
                                             // resource is actually released
@@ -593,14 +598,19 @@ where FNA: FnMut(P) -> FA,
             match await_result {
                 Ok((Some(ReleaseReq { generation: release_gen, status, }), release_rx_stream)) => {
                     if release_gen == generation {
-                        debug!("wait_loop: release request");
                         let maybe_resource = match status {
-                            ResourceStatus::Reimburse(resource) =>
-                                Some(Some(resource)),
-                            ResourceStatus::ResourceLost =>
-                                Some(None),
-                            ResourceStatus::ResourceFault =>
-                                None,
+                            ResourceStatus::Reimburse(resource) => {
+                                debug!("wait_loop: release request (resource reimbursed)");
+                                Some(Some(resource))
+                            },
+                            ResourceStatus::ResourceLost => {
+                                debug!("wait_loop: release request (resource lost)");
+                                Some(None)
+                            },
+                            ResourceStatus::ResourceFault => {
+                                debug!("wait_loop: release request (resource fault)");
+                                None
+                            },
                         };
                         let future = if let Some(released_resource) = maybe_resource {
                             // resource is actually released
@@ -613,10 +623,13 @@ where FNA: FnMut(P) -> FA,
                                         aquire_rx, params, aquire_fn, release_fn, close_fn, generation,
                                     };
                                     match release_result {
-                                        Ok(Resource::Available(state_avail)) =>
-                                            Either::A(result(Ok(Loop::Break(BreakWait::ProceedMain { core, state_avail, })))),
-                                        Ok(Resource::OutOfStock(state_no_left)) =>
-                                            if aquires_count > 0 {
+                                        Ok(Resource::Available(state_avail)) => {
+                                            debug!("{} got more resources, proceeding to main loop", core.params.name.as_ref());
+                                            Either::A(result(Ok(Loop::Break(BreakWait::ProceedMain { core, state_avail, }))))
+                                        },
+                                        Ok(Resource::OutOfStock(state_no_left)) => {
+                                            debug!("{} got no more resources, aquires left: {}", core.params.name.as_ref(), core.aquires_count);
+                                            if core.aquires_count > 0 {
                                                 Either::A(result(Ok(Loop::Continue(WaitState { core, state_no_left, }))))
                                             } else {
                                                 info!("{} runs out of resources, performing restart", core.params.name.as_ref());
@@ -626,7 +639,8 @@ where FNA: FnMut(P) -> FA,
                                                         Loop::Break(BreakWait::RequireRestart { core, init_state, })
                                                     });
                                                 Either::B(future)
-                                            },
+                                            }
+                                        },
                                         Err(ErrorSeverity::Recoverable { state: init_state, }) =>
                                             Either::A(result(Ok(Loop::Break(BreakWait::RequireRestart { core, init_state, })))),
                                         Err(ErrorSeverity::Fatal(())) => {
@@ -751,6 +765,7 @@ impl<R> Lode<R> {
         loop_fn(
             (self, using_fn, state),
             move |(Lode { aquire_tx, release_tx, shutdown_tx, }, mut using_fn, state)| {
+                debug!("using_resource_loop: aquiring resource");
                 let (resource_tx, resource_rx) = oneshot::channel();
                 aquire_tx
                     .send(AquireReq { reply_tx: resource_tx, })
@@ -765,11 +780,27 @@ impl<R> Lode<R> {
                                 UsingError::ResourceTaskGone
                             })
                             .and_then(move |ResourceGen { resource, generation, }| {
+                                debug!("using_resource_loop: resource aquired, passing control to user proc");
                                 using_fn(resource, state)
                                     .into_future()
                                     .then(move |using_result| {
                                         match using_result {
                                             Ok((maybe_resource, loop_action)) => {
+                                                debug!(
+                                                    "using_resource_loop: resource: {}, loop action: {}, releasing resource",
+                                                    match maybe_resource {
+                                                        UsingResource::Lost =>
+                                                            "lost",
+                                                        UsingResource::Reimburse(..) =>
+                                                            "reimbursed",
+                                                    },
+                                                    match loop_action {
+                                                        Loop::Break(..) =>
+                                                            "break",
+                                                        Loop::Continue(..) =>
+                                                            "continue",
+                                                    },
+                                                );
                                                 release_tx
                                                     .unbounded_send(ReleaseReq {
                                                         generation,
@@ -795,6 +826,7 @@ impl<R> Lode<R> {
                                                     })
                                             },
                                             Err(error) => {
+                                                debug!("using_resource_loop: an error occurred, releasing resource");
                                                 release_tx
                                                     .unbounded_send(ReleaseReq { generation, status: ResourceStatus::ResourceFault, })
                                                     .map_err(|_send_error| {
