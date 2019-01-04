@@ -36,6 +36,9 @@ use super::{
     RestartStrategy,
 };
 
+pub mod uniq;
+pub mod shared;
+
 #[cfg(test)]
 mod tests;
 
