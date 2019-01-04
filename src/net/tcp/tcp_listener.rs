@@ -47,8 +47,10 @@ where N: AsRef<str> + Send + 'static,
         sock_addr,
         init,
         aquire,
-        release,
-        close,
+        release_main,
+        release_wait,
+        close_main,
+        close_wait,
     )
 }
 
@@ -109,37 +111,38 @@ fn aquire(
         })
 }
 
-fn release(
-    state: Resource<BoundState, UnboundState>,
+fn release_main(
+    state: BoundState,
     maybe_tcp_stream: Option<TcpStream>,
 )
     -> impl Future<Item = Resource<BoundState, UnboundState>, Error = ErrorSeverity<SocketAddr, ()>>
 {
     future::result(Ok(match (state, maybe_tcp_stream) {
-        (Resource::Available(bound_state), Some(..)) => {
+        (bound_state, Some(..)) => {
             debug!("TcpListener reimbursement (dropping resource)");
             Resource::Available(bound_state)
         },
-        (Resource::Available(bound_state), None) => {
+        (bound_state, None) => {
             debug!("TcpListener release (resource lost)");
             Resource::Available(bound_state)
-        },
-        (Resource::OutOfStock(unbound_state), _) => {
-            warn!("unbound state (probably something went wrong)");
-            Resource::OutOfStock(unbound_state)
         },
     }))
 }
 
-fn close(
-    state: Resource<BoundState, UnboundState>,
+fn release_wait(
+    state: UnboundState,
+    _maybe_tcp_stream: Option<TcpStream>,
 )
-    -> impl Future<Item = SocketAddr, Error = ()>
+    -> impl Future<Item = Resource<BoundState, UnboundState>, Error = ErrorSeverity<SocketAddr, ()>>
 {
-    future::result(Ok(match state {
-        Resource::Available(BoundState { sock_addr, .. }) =>
-            sock_addr,
-        Resource::OutOfStock(UnboundState { sock_addr, }) =>
-            sock_addr,
-    }))
+    warn!("unbound state (probably something went wrong)");
+    future::result(Ok(Resource::OutOfStock(state)))
+}
+
+fn close_main(state: BoundState) -> impl Future<Item = SocketAddr, Error = ()> {
+    future::result(Ok(state.sock_addr))
+}
+
+fn close_wait(state: UnboundState) -> impl Future<Item = SocketAddr, Error = ()> {
+    future::result(Ok(state.sock_addr))
 }

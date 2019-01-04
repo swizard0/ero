@@ -26,8 +26,10 @@ fn check_sequence() {
     enum Notify {
         InitFn,
         AquireFn,
-        ReleaseFn,
-        CloseFn,
+        ReleaseMainFn,
+        ReleaseWaitFn,
+        CloseMainFn,
+        CloseWaitFn,
     }
 
     struct ResourceItem;
@@ -50,24 +52,26 @@ fn check_sequence() {
                 .map_err(|_| ErrorSeverity::Fatal(()))
                 .map(|_| (ResourceItem, Resource::Available(tx)))
         },
-        |resource, _maybe_resource| {
-            let tx = match resource {
-                Resource::Available(tx) => tx,
-                Resource::OutOfStock(tx) => tx,
-            };
-            tx.unbounded_send(Notify::ReleaseFn)
+        |tx, _maybe_resource| {
+            tx.unbounded_send(Notify::ReleaseMainFn)
                 .map_err(|_| ErrorSeverity::Fatal(()))
                 .map(|_| Resource::Available(tx))
         },
-        |resource| {
-            let tx = match resource {
-                Resource::Available(tx) => tx,
-                Resource::OutOfStock(tx) => tx,
-            };
-            tx.unbounded_send(Notify::CloseFn)
+        |tx: mpsc::UnboundedSender<_>, _maybe_resource| {
+            tx.unbounded_send(Notify::ReleaseWaitFn)
+                .map_err(|_| ErrorSeverity::Fatal(()))
+                .map(|_| Resource::Available(tx))
+        },
+        |tx| {
+            tx.unbounded_send(Notify::CloseMainFn)
                 .map_err(|_| ())
                 .map(|_| tx)
-        }
+        },
+        |tx| {
+            tx.unbounded_send(Notify::CloseWaitFn)
+                .map_err(|_| ())
+                .map(|_| tx)
+        },
     );
 
     let result: Result<(), ()> = runtime.block_on(
@@ -138,7 +142,7 @@ fn check_sequence() {
                 rx.into_future()
                     .then(|result| {
                         match result {
-                            Ok((Some(Notify::ReleaseFn), rx)) =>
+                            Ok((Some(Notify::ReleaseMainFn), rx)) =>
                                 Ok((aquire_tx, release_tx, shutdown_tx, rx)),
                             Ok((other, _rx)) =>
                                 panic!("expected tracking rx to be ReleaseFn but it is: {:?}", other),
@@ -200,7 +204,7 @@ fn check_sequence() {
                 rx.into_future()
                     .then(|result| {
                         match result {
-                            Ok((Some(Notify::CloseFn), rx)) =>
+                            Ok((Some(Notify::CloseMainFn), rx)) =>
                                 Ok((aquire_tx, release_tx, shutdown_tx, rx)),
                             Ok((other, _rx)) =>
                                 panic!("expected tracking rx to be CloseFn but it is: {:?}", other),

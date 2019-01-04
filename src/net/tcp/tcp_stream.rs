@@ -42,8 +42,10 @@ where N: AsRef<str> + Send + 'static,
         sock_addr,
         init,
         aquire,
-        release,
-        close,
+        release_main,
+        release_wait,
+        close_main,
+        close_wait,
     )
 }
 
@@ -88,41 +90,46 @@ fn aquire(
     future::result(Ok((tcp_stream, Resource::OutOfStock(DisconnectedState { sock_addr, }))))
 }
 
-fn release(
-    state: Resource<ConnectedState, DisconnectedState>,
+fn release_main(
+    state: ConnectedState,
     maybe_tcp_stream: Option<TcpStream>,
 )
     -> impl Future<Item = Resource<ConnectedState, DisconnectedState>, Error = ErrorSeverity<SocketAddr, ()>>
 {
     future::result(Ok(match (state, maybe_tcp_stream) {
-        (Resource::Available(ConnectedState { sock_addr, .. }), Some(tcp_stream)) => {
+        (ConnectedState { sock_addr, .. }, Some(tcp_stream)) => {
             warn!("replacing existing TcpStream (probably something went wrong)");
             Resource::Available(ConnectedState { sock_addr, tcp_stream, })
         },
-        (Resource::Available(connected_state), None) => {
+        (connected_state, None) => {
             warn!("keeping current TcpStream while resource is lost (probably something went wrong)");
             Resource::Available(connected_state)
         },
-        (Resource::OutOfStock(DisconnectedState { sock_addr, }), Some(tcp_stream)) => {
+    }))
+}
+
+fn release_wait(
+    state: DisconnectedState,
+    maybe_tcp_stream: Option<TcpStream>,
+)
+    -> impl Future<Item = Resource<ConnectedState, DisconnectedState>, Error = ErrorSeverity<SocketAddr, ()>>
+{
+    future::result(Ok(match (state, maybe_tcp_stream) {
+        (DisconnectedState { sock_addr, }, Some(tcp_stream)) => {
             debug!("TcpStream reimbursement");
             Resource::Available(ConnectedState { sock_addr, tcp_stream, })
         },
-        (Resource::OutOfStock(disconnected_state), None) => {
+        (disconnected_state, None) => {
             debug!("TcpStream is completely lost");
             Resource::OutOfStock(disconnected_state)
         },
     }))
 }
 
-fn close(
-    state: Resource<ConnectedState, DisconnectedState>,
-)
-    -> impl Future<Item = SocketAddr, Error = ()>
-{
-    future::result(Ok(match state {
-        Resource::Available(ConnectedState { sock_addr, .. }) =>
-            sock_addr,
-        Resource::OutOfStock(DisconnectedState { sock_addr, }) =>
-            sock_addr,
-    }))
+fn close_main(state: ConnectedState) -> impl Future<Item = SocketAddr, Error = ()> {
+    future::result(Ok(state.sock_addr))
+}
+
+fn close_wait(state: DisconnectedState) -> impl Future<Item = SocketAddr, Error = ()> {
+    future::result(Ok(state.sock_addr))
 }

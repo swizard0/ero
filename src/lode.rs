@@ -79,14 +79,16 @@ pub struct Params<N> {
     pub restart_strategy: RestartStrategy,
 }
 
-pub fn spawn<FNI, FI, FNA, FA, FNR, FR, FNC, FC, N, S, R, P, Q>(
+pub fn spawn<FNI, FI, FNA, FA, FNRM, FRM, FNRW, FRW, FNCM, FCM, FNCW, FCW, N, S, R, P, Q>(
     executor: &tokio::runtime::TaskExecutor,
     params: Params<N>,
     init_state: S,
     init_fn: FNI,
     aquire_fn: FNA,
-    release_fn: FNR,
-    close_fn: FNC,
+    release_main_fn: FNRM,
+    release_wait_fn: FNRW,
+    close_main_fn: FNCM,
+    close_wait_fn: FNCW,
 )
     -> Lode<R>
 where FNI: FnMut(S) -> FI + Send + 'static,
@@ -95,12 +97,18 @@ where FNI: FnMut(S) -> FI + Send + 'static,
       FNA: FnMut(P) -> FA + Send + 'static,
       FA: IntoFuture<Item = (R, Resource<P, Q>), Error = ErrorSeverity<S, ()>> + 'static,
       FA::Future: Send,
-      FNR: FnMut(Resource<P, Q>, Option<R>) -> FR + Send + 'static,
-      FR: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>> + 'static,
-      FR::Future: Send,
-      FNC: FnMut(Resource<P, Q>) -> FC + Send + 'static,
-      FC: IntoFuture<Item = S, Error = ()> + Send + 'static,
-      FC::Future: Send,
+      FNRM: FnMut(P, Option<R>) -> FRM + Send + 'static,
+      FRM: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>> + 'static,
+      FRM::Future: Send,
+      FNRW: FnMut(Q, Option<R>) -> FRW + Send + 'static,
+      FRW: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>> + 'static,
+      FRW::Future: Send,
+      FNCM: FnMut(P) -> FCM + Send + 'static,
+      FCM: IntoFuture<Item = S, Error = ()> + Send + 'static,
+      FCM::Future: Send,
+      FNCW: FnMut(Q) -> FCW + Send + 'static,
+      FCW: IntoFuture<Item = S, Error = ()> + Send + 'static,
+      FCW::Future: Send,
       N: AsRef<str> + Send + 'static,
       S: Send + 'static,
       R: Send + 'static,
@@ -119,9 +127,13 @@ where FNI: FnMut(S) -> FI + Send + 'static,
                 aquires_count: 0,
                 generation: 0,
                 params,
-                aquire_fn,
-                release_fn,
-                close_fn,
+                vtable: VTable {
+                    aquire_fn,
+                    release_main_fn,
+                    release_wait_fn,
+                    close_main_fn,
+                    close_wait_fn,
+                },
             },
             aquire_req_pending: None,
             init_state,
@@ -155,36 +167,46 @@ where FNI: FnMut(S) -> FI + Send + 'static,
     }
 }
 
-struct Core<FNA, FNR, FNC, N, R> {
+struct VTable<FNA, FNRM, FNRW, FNCM, FNCW> {
+    aquire_fn: FNA,
+    release_main_fn: FNRM,
+    release_wait_fn: FNRW,
+    close_main_fn: FNCM,
+    close_wait_fn: FNCW,
+}
+
+struct Core<FNA, FNRM, FNRW, FNCM, FNCW, N, R> {
     aquire_rx: stream::StreamFuture<mpsc::Receiver<AquireReq<R>>>,
     release_rx: stream::StreamFuture<mpsc::UnboundedReceiver<ReleaseReq<R>>>,
     params: Params<N>,
-    aquire_fn: FNA,
-    release_fn: FNR,
-    close_fn: FNC,
+    vtable: VTable<FNA, FNRM, FNRW, FNCM, FNCW>,
     aquires_count: usize,
     generation: Generation,
 }
 
-struct RestartState<FNI, FNA, FNR, FNC, N, S, R> {
-    core: Core<FNA, FNR, FNC, N, R>,
+struct RestartState<FNI, FNA, FNRM, FNRW, FNCM, FNCW, N, S, R> {
+    core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N, R>,
     aquire_req_pending: Option<AquireReq<R>>,
     init_state: S,
     init_fn: FNI,
 }
 
-fn restart_loop<FNI, FS, FNA, FA, FNR, FR, FNC, FC, N, S, R, P, Q>(
-    restart_state: RestartState<FNI, FNA, FNR, FNC, N, S, R>,
+fn restart_loop<FNI, FS, FNA, FA, FNRM, FRM, FNRW, FRW, FNCM, FCM, FNCW, FCW, N, S, R, P, Q>(
+    restart_state: RestartState<FNI, FNA, FNRM, FNRW, FNCM, FNCW, N, S, R>,
 )
-    -> impl Future<Item = Loop<(), RestartState<FNI, FNA, FNR, FNC, N, S, R>>, Error = ()>
+    -> impl Future<Item = Loop<(), RestartState<FNI, FNA, FNRM, FNRW, FNCM, FNCW, N, S, R>>, Error = ()>
 where FNI: FnMut(S) -> FS + Send + 'static,
       FS: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>>,
       FNA: FnMut(P) -> FA,
       FA: IntoFuture<Item = (R, Resource<P, Q>), Error = ErrorSeverity<S, ()>>,
-      FNR: FnMut(Resource<P, Q>, Option<R>) -> FR,
-      FR: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>>,
-      FNC: FnMut(Resource<P, Q>) -> FC,
-      FC: IntoFuture<Item = S, Error = ()>,
+      FNRM: FnMut(P, Option<R>) -> FRM,
+      FRM: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>>,
+      FNRW: FnMut(Q, Option<R>) -> FRW,
+      FRW: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>>,
+      FNCM: FnMut(P) -> FCM,
+      FCM: IntoFuture<Item = S, Error = ()>,
+      FNCW: FnMut(Q) -> FCW,
+      FCW: IntoFuture<Item = S, Error = ()>,
       N: AsRef<str>,
 {
     let RestartState { core, init_state, mut init_fn, mut aquire_req_pending, } = restart_state;
@@ -223,7 +245,7 @@ where FNI: FnMut(S) -> FS + Send + 'static,
                                 },
                                 Ok(Resource::OutOfStock(state_no_left)) => {
                                     warn!("initializing gives no resource in {}", core.params.name.as_ref());
-                                    let future = (core.close_fn)(Resource::OutOfStock(state_no_left))
+                                    let future = (core.vtable.close_wait_fn)(state_no_left)
                                         .into_future()
                                         .and_then(move |init_state| {
                                             proceed_with_restart(RestartState {
@@ -254,17 +276,17 @@ where FNI: FnMut(S) -> FS + Send + 'static,
         })
 }
 
-enum AquireWait<FNA, FNR, FNC, N, R> {
-    Arrived { aquire_req: AquireReq<R>, core: Core<FNA, FNR, FNC, N, R>, },
+enum AquireWait<FNA, FNRM, FNRW, FNCM, FNCW, N, R> {
+    Arrived { aquire_req: AquireReq<R>, core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N, R>, },
     Shutdown,
 }
 
-fn wait_for_aquire<FNA, FNR, FNC, N, R>(
-    core: Core<FNA, FNR, FNC, N, R>
+fn wait_for_aquire<FNA, FNRM, FNRW, FNCM, FNCW, N, R>(
+    core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N, R>
 )
-    -> impl Future<Item = AquireWait<FNA, FNR, FNC, N, R>, Error = ()>
+    -> impl Future<Item = AquireWait<FNA, FNRM, FNRW, FNCM, FNCW, N, R>, Error = ()>
 {
-    let Core { aquire_rx, release_rx, params, aquire_fn, release_fn, close_fn, aquires_count, generation, } = core;
+    let Core { aquire_rx, release_rx, params, vtable, aquires_count, generation, } = core;
     aquire_rx
         .then(move |await_result| {
             match await_result {
@@ -274,7 +296,7 @@ fn wait_for_aquire<FNA, FNR, FNC, N, R>(
                         aquire_req,
                         core: Core {
                             aquire_rx: aquire_rx_stream.into_future(),
-                            release_rx, params, aquire_fn, release_fn, close_fn, aquires_count, generation,
+                            release_rx, params, vtable, aquires_count, generation,
                         },
                     })
                 },
@@ -290,31 +312,35 @@ fn wait_for_aquire<FNA, FNR, FNC, N, R>(
         })
 }
 
-enum BreakOuter<FNA, FNR, FNC, N, S, R> {
+enum BreakOuter<FNA, FNRM, FNRW, FNCM, FNCW, N, S, R> {
     Shutdown,
     RequireRestart {
-        core: Core<FNA, FNR, FNC, N, R>,
+        core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N, R>,
         init_state: S,
         aquire_req_pending: Option<AquireReq<R>>,
     },
 }
 
-struct OuterState<FNA, FNR, FNC, N, R, P> {
-    core: Core<FNA, FNR, FNC, N, R>,
+struct OuterState<FNA, FNRM, FNRW, FNCM, FNCW, N, R, P> {
+    core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N, R>,
     state_avail: P,
     aquire_req_pending: Option<AquireReq<R>>,
 }
 
-fn outer_loop<FNA, FA, FNR, FR, FNC, FC, N, S, R, P, Q>(
-    outer_state: OuterState<FNA, FNR, FNC, N, R, P>,
+fn outer_loop<FNA, FA, FNRM, FRM, FNRW, FRW, FNCM, FCM, FNCW, FCW, N, S, R, P, Q>(
+    outer_state: OuterState<FNA, FNRM, FNRW, FNCM, FNCW, N, R, P>,
 )
-    -> impl Future<Item = Loop<BreakOuter<FNA, FNR, FNC, N, S, R>, OuterState<FNA, FNR, FNC, N, R, P>>, Error = ()>
+    -> impl Future<Item = Loop<BreakOuter<FNA, FNRM, FNRW, FNCM, FNCW, N, S, R>, OuterState<FNA, FNRM, FNRW, FNCM, FNCW, N, R, P>>, Error = ()>
 where FNA: FnMut(P) -> FA,
       FA: IntoFuture<Item = (R, Resource<P, Q>), Error = ErrorSeverity<S, ()>>,
-      FNR: FnMut(Resource<P, Q>, Option<R>) -> FR,
-      FR: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>>,
-      FNC: FnMut(Resource<P, Q>) -> FC,
-      FC: IntoFuture<Item = S, Error = ()>,
+      FNRM: FnMut(P, Option<R>) -> FRM,
+      FRM: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>>,
+      FNRW: FnMut(Q, Option<R>) -> FRW,
+      FRW: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>>,
+      FNCM: FnMut(P) -> FCM,
+      FCM: IntoFuture<Item = S, Error = ()>,
+      FNCW: FnMut(Q) -> FCW,
+      FCW: IntoFuture<Item = S, Error = ()>,
       N: AsRef<str>,
 {
     let OuterState { core, state_avail, aquire_req_pending, } = outer_state;
@@ -344,48 +370,52 @@ where FNA: FnMut(P) -> FA,
         })
 }
 
-enum BreakMain<FNA, FNR, FNC, N, S, R, Q> {
+enum BreakMain<FNA, FNRM, FNRW, FNCM, FNCW, N, S, R, Q> {
     Shutdown,
     RequireRestart {
-        core: Core<FNA, FNR, FNC, N, R>,
+        core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N, R>,
         init_state: S,
         aquire_req_pending: Option<AquireReq<R>>,
     },
     WaitRelease {
-        core: Core<FNA, FNR, FNC, N, R>,
+        core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N, R>,
         state_no_left: Q,
     },
 }
 
-struct MainState<FNA, FNR, FNC, N, R, P> {
-    core: Core<FNA, FNR, FNC, N, R>,
+struct MainState<FNA, FNRM, FNRW, FNCM, FNCW, N, R, P> {
+    core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N, R>,
     state_avail: P,
     aquire_req_pending: Option<AquireReq<R>>,
 }
 
-fn main_loop<FNA, FA, FNR, FR, FNC, FC, N, S, R, P, Q>(
-    main_state: MainState<FNA, FNR, FNC, N, R, P>,
+fn main_loop<FNA, FA, FNRM, FRM, FNRW, FRW, FNCM, FCM, FNCW, FCW, N, S, R, P, Q>(
+    main_state: MainState<FNA, FNRM, FNRW, FNCM, FNCW, N, R, P>,
 )
-    -> impl Future<Item = Loop<BreakMain<FNA, FNR, FNC, N, S, R, Q>, MainState<FNA, FNR, FNC, N, R, P>>, Error = ()>
+    -> impl Future<Item = Loop<BreakMain<FNA, FNRM, FNRW, FNCM, FNCW, N, S, R, Q>, MainState<FNA, FNRM, FNRW, FNCM, FNCW, N, R, P>>, Error = ()>
 where FNA: FnMut(P) -> FA,
       FA: IntoFuture<Item = (R, Resource<P, Q>), Error = ErrorSeverity<S, ()>>,
-      FNR: FnMut(Resource<P, Q>, Option<R>) -> FR,
-      FR: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>>,
-      FNC: FnMut(Resource<P, Q>) -> FC,
-      FC: IntoFuture<Item = S, Error = ()>,
+      FNRM: FnMut(P, Option<R>) -> FRM,
+      FRM: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>>,
+      FNRW: FnMut(Q, Option<R>) -> FRW,
+      FRW: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>>,
+      FNCM: FnMut(P) -> FCM,
+      FCM: IntoFuture<Item = S, Error = ()>,
+      FNCW: FnMut(Q) -> FCW,
+      FCW: IntoFuture<Item = S, Error = ()>,
       N: AsRef<str>,
 {
     let MainState {
-        core: Core { aquire_rx, release_rx, params, mut aquire_fn, release_fn, close_fn, aquires_count, generation, },
+        core: Core { aquire_rx, release_rx, params, mut vtable, aquires_count, generation, },
         state_avail,
         aquire_req_pending,
     } = main_state;
 
-    enum AquireProcess<FNA, FNR, FNC, N, S, R, P, Q> {
-        Proceed { core: Core<FNA, FNR, FNC, N, R>, state_avail: P, },
-        WaitRelease { core: Core<FNA, FNR, FNC, N, R>, state_no_left: Q, },
+    enum AquireProcess<FNA, FNRM, FNRW, FNCM, FNCW, N, S, R, P, Q> {
+        Proceed { core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N, R>, state_avail: P, },
+        WaitRelease { core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N, R>, state_no_left: Q, },
         RequireRestart {
-            core: Core<FNA, FNR, FNC, N, R>,
+            core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N, R>,
             init_state: S,
             aquire_req_pending: Option<AquireReq<R>>,
         }
@@ -393,7 +423,7 @@ where FNA: FnMut(P) -> FA,
 
     let future = if let Some(AquireReq { reply_tx, }) = aquire_req_pending {
         debug!("main_loop: process the aquire request");
-        let future = aquire_fn(state_avail)
+        let future = (vtable.aquire_fn)(state_avail)
             .into_future()
             .then(move |aquire_result| {
                 match aquire_result {
@@ -406,7 +436,7 @@ where FNA: FnMut(P) -> FA,
                                 aquires_count
                             },
                         };
-                        let core = Core { aquire_rx, release_rx, params, aquire_fn, release_fn, close_fn, aquires_count, generation, };
+                        let core = Core { aquire_rx, release_rx, params, vtable, aquires_count, generation, };
                         match resource_status {
                             Resource::Available(state_avail) =>
                                 Ok(AquireProcess::Proceed { core, state_avail, }),
@@ -418,7 +448,7 @@ where FNA: FnMut(P) -> FA,
                     Err(ErrorSeverity::Recoverable { state: init_state, }) => {
                         Ok(AquireProcess::RequireRestart {
                             core: Core {
-                                aquire_rx, release_rx, params, aquire_fn, release_fn, close_fn, aquires_count, generation,
+                                aquire_rx, release_rx, params, vtable, aquires_count, generation,
                             },
                             aquire_req_pending: Some(AquireReq { reply_tx, }),
                             init_state,
@@ -434,7 +464,7 @@ where FNA: FnMut(P) -> FA,
     } else {
         Either::B(result(Ok(AquireProcess::Proceed {
             core: Core {
-                aquire_rx, release_rx, params, aquire_fn, release_fn, close_fn, aquires_count, generation,
+                aquire_rx, release_rx, params, vtable, aquires_count, generation,
             },
             state_avail,
         })))
@@ -444,7 +474,7 @@ where FNA: FnMut(P) -> FA,
         .and_then(|aquire_process| {
             match aquire_process {
                 AquireProcess::Proceed { core, state_avail, } => {
-                    let Core { aquire_rx, release_rx, params, aquire_fn, mut release_fn, mut close_fn, aquires_count, generation, } = core;
+                    let Core { aquire_rx, release_rx, params, mut vtable, aquires_count, generation, } = core;
                     let future = aquire_rx
                         .select2(release_rx)
                         .then(move |await_result| {
@@ -454,7 +484,7 @@ where FNA: FnMut(P) -> FA,
                                     Either::B(result(Ok(Loop::Continue(MainState {
                                         core: Core {
                                             aquire_rx: aquire_rx_stream.into_future(),
-                                            release_rx, params, aquire_fn, release_fn, close_fn, aquires_count, generation,
+                                            release_rx, params, vtable, aquires_count, generation,
                                         },
                                         state_avail,
                                         aquire_req_pending: Some(aquire_req),
@@ -482,13 +512,13 @@ where FNA: FnMut(P) -> FA,
                                         };
                                         let future = if let Some(released_resource) = maybe_resource {
                                             // resource is actually released
-                                            let future = release_fn(Resource::Available(state_avail), released_resource)
+                                            let future = (vtable.release_main_fn)(state_avail, released_resource)
                                                 .into_future()
                                                 .then(move |release_result| {
                                                     let core = Core {
                                                         release_rx: release_rx_stream.into_future(),
                                                         aquires_count: if aquires_count > 0 { aquires_count - 1 } else { 0 },
-                                                        aquire_rx, params, aquire_fn, release_fn, close_fn, generation,
+                                                        aquire_rx, params, vtable, generation,
                                                     };
                                                     match release_result {
                                                         Ok(Resource::Available(state_avail)) =>
@@ -507,14 +537,14 @@ where FNA: FnMut(P) -> FA,
                                         } else {
                                             // something wrong with resource, schedule restart
                                             warn!("resource fault report: performing restart");
-                                            let future = close_fn(Resource::Available(state_avail))
+                                            let future = (vtable.close_main_fn)(state_avail)
                                                 .into_future()
                                                 .map(move |init_state| {
                                                     Loop::Break(BreakMain::RequireRestart {
                                                         core: Core {
                                                             release_rx: release_rx_stream.into_future(),
                                                             aquires_count: if aquires_count > 0 { aquires_count - 1 } else { 0 },
-                                                            aquire_rx, params, aquire_fn, release_fn, close_fn, generation,
+                                                            aquire_rx, params, vtable, generation,
                                                         },
                                                         init_state,
                                                         aquire_req_pending: None,
@@ -528,7 +558,7 @@ where FNA: FnMut(P) -> FA,
                                         Either::B(result(Ok(Loop::Continue(MainState {
                                             core: Core {
                                                 release_rx: release_rx_stream.into_future(),
-                                                aquire_rx, params, aquire_fn, release_fn, close_fn, aquires_count, generation,
+                                                aquire_rx, params, vtable, aquires_count, generation,
                                             },
                                             state_avail,
                                             aquire_req_pending: None,
@@ -559,37 +589,41 @@ where FNA: FnMut(P) -> FA,
         })
 }
 
-enum BreakWait<FNA, FNR, FNC, N, S, R, P> {
+enum BreakWait<FNA, FNRM, FNRW, FNCM, FNCW, N, S, R, P> {
     Shutdown,
     RequireRestart {
-        core: Core<FNA, FNR, FNC, N, R>,
+        core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N, R>,
         init_state: S,
     },
     ProceedMain {
-        core: Core<FNA, FNR, FNC, N, R>,
+        core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N, R>,
         state_avail: P,
     },
 }
 
-struct WaitState<FNA, FNR, FNC, N, R, Q> {
-    core: Core<FNA, FNR, FNC, N, R>,
+struct WaitState<FNA, FNRM, FNRW, FNCM, FNCW, N, R, Q> {
+    core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N, R>,
     state_no_left: Q,
 }
 
-fn wait_loop<FNA, FA, FNR, FR, FNC, FC, N, S, R, P, Q>(
-    wait_state: WaitState<FNA, FNR, FNC, N, R, Q>,
+fn wait_loop<FNA, FA, FNRM, FRM, FNRW, FRW, FNCM, FCM, FNCW, FCW, N, S, R, P, Q>(
+    wait_state: WaitState<FNA, FNRM, FNRW, FNCM, FNCW, N, R, Q>,
 )
-    -> impl Future<Item = Loop<BreakWait<FNA, FNR, FNC, N, S, R, P>, WaitState<FNA, FNR, FNC, N, R, Q>>, Error = ()>
+    -> impl Future<Item = Loop<BreakWait<FNA, FNRM, FNRW, FNCM, FNCW, N, S, R, P>, WaitState<FNA, FNRM, FNRW, FNCM, FNCW, N, R, Q>>, Error = ()>
 where FNA: FnMut(P) -> FA,
       FA: IntoFuture<Item = (R, Resource<P, Q>), Error = ErrorSeverity<S, ()>>,
-      FNR: FnMut(Resource<P, Q>, Option<R>) -> FR,
-      FR: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>>,
-      FNC: FnMut(Resource<P, Q>) -> FC,
-      FC: IntoFuture<Item = S, Error = ()>,
+      FNRM: FnMut(P, Option<R>) -> FRM,
+      FRM: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>>,
+      FNRW: FnMut(Q, Option<R>) -> FRW,
+      FRW: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>>,
+      FNCM: FnMut(P) -> FCM,
+      FCM: IntoFuture<Item = S, Error = ()>,
+      FNCW: FnMut(Q) -> FCW,
+      FCW: IntoFuture<Item = S, Error = ()>,
       N: AsRef<str>,
 {
     let WaitState {
-        core: Core { aquire_rx, release_rx, params, aquire_fn, mut release_fn, mut close_fn, aquires_count, generation, },
+        core: Core { aquire_rx, release_rx, params, mut vtable, aquires_count, generation, },
         state_no_left,
     } = wait_state;
 
@@ -614,13 +648,13 @@ where FNA: FnMut(P) -> FA,
                         };
                         let future = if let Some(released_resource) = maybe_resource {
                             // resource is actually released
-                            let future = release_fn(Resource::OutOfStock(state_no_left), released_resource)
+                            let future = (vtable.release_wait_fn)(state_no_left, released_resource)
                                 .into_future()
                                 .then(move |release_result| {
                                     let mut core = Core {
                                         release_rx: release_rx_stream.into_future(),
                                         aquires_count: if aquires_count > 0 { aquires_count - 1 } else { 0 },
-                                        aquire_rx, params, aquire_fn, release_fn, close_fn, generation,
+                                        aquire_rx, params, vtable, generation,
                                     };
                                     match release_result {
                                         Ok(Resource::Available(state_avail)) => {
@@ -633,7 +667,7 @@ where FNA: FnMut(P) -> FA,
                                                 Either::A(result(Ok(Loop::Continue(WaitState { core, state_no_left, }))))
                                             } else {
                                                 info!("{} runs out of resources, performing restart", core.params.name.as_ref());
-                                                let future = (core.close_fn)(Resource::OutOfStock(state_no_left))
+                                                let future = (core.vtable.close_wait_fn)(state_no_left)
                                                     .into_future()
                                                     .map(move |init_state| {
                                                         Loop::Break(BreakWait::RequireRestart { core, init_state, })
@@ -653,14 +687,14 @@ where FNA: FnMut(P) -> FA,
                         } else {
                             // something wrong with resource, schedule restart
                             warn!("resource fault report: performing restart");
-                            let future = close_fn(Resource::OutOfStock(state_no_left))
+                            let future = (vtable.close_wait_fn)(state_no_left)
                                 .into_future()
                                 .map(move |init_state| {
                                     Loop::Break(BreakWait::RequireRestart {
                                         core: Core {
                                             release_rx: release_rx_stream.into_future(),
                                             aquires_count: if aquires_count > 0 { aquires_count - 1 } else { 0 },
-                                            aquire_rx, params, aquire_fn, release_fn, close_fn, generation,
+                                            aquire_rx, params, vtable, generation,
                                         },
                                         init_state,
                                     })
@@ -672,7 +706,7 @@ where FNA: FnMut(P) -> FA,
                         debug!("wait_loop: skipping obsolete release request");
                         let core = Core {
                             release_rx: release_rx_stream.into_future(),
-                            aquire_rx, params, aquire_fn, release_fn, close_fn, aquires_count, generation,
+                            aquire_rx, params, vtable, aquires_count, generation,
                         };
                         Either::B(result(Ok(Loop::Continue(WaitState { core, state_no_left, }))))
                     }
@@ -689,10 +723,10 @@ where FNA: FnMut(P) -> FA,
         })
 }
 
-fn proceed_with_restart<FNI, FNA, FNR, FNC, N, S, R>(
-    restart_state: RestartState<FNI, FNA, FNR, FNC, N, S, R>,
+fn proceed_with_restart<FNI, FNA, FNRM, FNRW, FNCM, FNCW, N, S, R>(
+    restart_state: RestartState<FNI, FNA, FNRM, FNRW, FNCM, FNCW, N, S, R>,
 )
-    -> impl Future<Item = Loop<(), RestartState<FNI, FNA, FNR, FNC, N, S, R>>, Error = ()>
+    -> impl Future<Item = Loop<(), RestartState<FNI, FNA, FNRM, FNRW, FNCM, FNCW, N, S, R>>, Error = ()>
 where N: AsRef<str>,
 {
     match restart_state.core.params.restart_strategy {
