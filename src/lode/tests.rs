@@ -19,6 +19,7 @@ use super::{
 
 #[test]
 fn check_sequence() {
+    let _ = pretty_env_logger::try_init();
     let mut runtime = tokio::runtime::Runtime::new().unwrap();
     let executor = runtime.executor();
 
@@ -291,4 +292,45 @@ fn check_sequence() {
             })
     );
     assert_eq!(result, Ok(()));
+}
+
+#[test]
+fn lode_stream() {
+    let _ = pretty_env_logger::try_init();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let executor = runtime.executor();
+
+    let lode_stream = super::stream::spawn(
+        &executor,
+        super::Params {
+            name: "lode_stream",
+            restart_strategy: RestartStrategy::RestartImmediately,
+        },
+        vec![0, 1, 2],
+        |vec| {
+            Ok((futures::stream::iter_ok(vec.clone()), vec))
+        },
+    );
+    executor.spawn(
+        lode_stream.steal_resource()
+            .and_then(|(item, lode_stream)| {
+                assert_eq!(item, 0);
+                lode_stream.steal_resource()
+            })
+            .and_then(|(item, lode_stream)| {
+                assert_eq!(item, 1);
+                lode_stream.steal_resource()
+            })
+            .and_then(|(item, lode_stream)| {
+                assert_eq!(item, 2);
+                lode_stream.steal_resource()
+            })
+            .and_then(|(item, lode_stream)| {
+                assert_eq!(item, 0);
+                lode_stream.shutdown();
+                Ok(())
+            })
+    );
+
+    let _ = runtime.shutdown_on_idle().wait();
 }

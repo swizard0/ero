@@ -10,15 +10,15 @@ use futures::{
         result,
         Either,
     },
-    Sink,
-    stream,
-    Future,
-    Stream,
-    IntoFuture,
+    stream::StreamFuture,
     sync::{
         mpsc,
         oneshot,
     },
+    Sink,
+    Future,
+    Stream,
+    IntoFuture,
 };
 
 use log::{
@@ -38,6 +38,7 @@ use super::{
 
 pub mod uniq;
 pub mod shared;
+pub mod stream;
 
 #[cfg(test)]
 mod tests;
@@ -179,8 +180,8 @@ struct VTable<FNA, FNRM, FNRW, FNCM, FNCW> {
 }
 
 struct Core<FNA, FNRM, FNRW, FNCM, FNCW, N, R> {
-    aquire_rx: stream::StreamFuture<mpsc::Receiver<AquireReq<R>>>,
-    release_rx: stream::StreamFuture<mpsc::UnboundedReceiver<ReleaseReq<R>>>,
+    aquire_rx: StreamFuture<mpsc::Receiver<AquireReq<R>>>,
+    release_rx: StreamFuture<mpsc::UnboundedReceiver<ReleaseReq<R>>>,
     params: Params<N>,
     vtable: VTable<FNA, FNRM, FNRW, FNCM, FNCW>,
     aquires_count: usize,

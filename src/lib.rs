@@ -1,3 +1,5 @@
+#![type_length_limit="8388608"]
+
 use std::time::Duration;
 
 pub use futures::future::Loop;
