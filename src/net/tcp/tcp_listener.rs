@@ -27,7 +27,7 @@ pub fn spawn<N>(
     executor: &tokio::runtime::TaskExecutor,
     params: Params<N>,
 )
-    -> Lode<TcpStream>
+    -> Lode<Option<TcpStream>>
 where N: AsRef<str> + Send + 'static,
 {
     let Params { sock_addr, lode_params, } = params;

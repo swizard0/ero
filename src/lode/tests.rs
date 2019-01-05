@@ -314,19 +314,23 @@ fn lode_stream() {
     executor.spawn(
         lode_stream.steal_resource()
             .and_then(|(item, lode_stream)| {
-                assert_eq!(item, 0);
+                assert_eq!(item, Some(0));
                 lode_stream.steal_resource()
             })
             .and_then(|(item, lode_stream)| {
-                assert_eq!(item, 1);
+                assert_eq!(item, Some(1));
                 lode_stream.steal_resource()
             })
             .and_then(|(item, lode_stream)| {
-                assert_eq!(item, 2);
+                assert_eq!(item, Some(2));
                 lode_stream.steal_resource()
             })
             .and_then(|(item, lode_stream)| {
-                assert_eq!(item, 0);
+                assert_eq!(item, None);
+                lode_stream.steal_resource()
+            })
+            .and_then(|(item, lode_stream)| {
+                assert_eq!(item, Some(0));
                 lode_stream.shutdown();
                 Ok(())
             })

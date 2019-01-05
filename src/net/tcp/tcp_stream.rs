@@ -58,7 +58,7 @@ fn init(
 )
     -> impl Future<Item = ConnectedState, Error = ErrorSeverity<SocketAddr, ()>>
 {
-    debug!("TcpStream initialize");
+    debug!("TcpStream connecting to {:?}", sock_addr);
     TcpStream::connect(&sock_addr)
         .then(move |connect_result| {
             match connect_result {

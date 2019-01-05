@@ -735,7 +735,7 @@ where N: AsRef<str>,
 {
     match restart_state.core.params.restart_strategy {
         RestartStrategy::RestartImmediately => {
-            error!("restarting {} immediately", restart_state.core.params.name.as_ref());
+            info!("restarting {} immediately", restart_state.core.params.name.as_ref());
             Either::B(result(Ok(Loop::Continue(restart_state))))
         },
         RestartStrategy::Delay { restart_after, } => {
