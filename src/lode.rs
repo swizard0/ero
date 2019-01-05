@@ -239,10 +239,10 @@ where FNI: FnMut(S) -> FS + Send + 'static,
                                                     let future = proceed_with_restart(RestartState {
                                                         core, init_state, init_fn, aquire_req_pending,
                                                     });
-                                                    Either::B(Either::A(future))
+                                                    Either::B(future)
                                                 },
                                                 Err(()) =>
-                                                    Either::B(Either::B(result(Err(())))),
+                                                    Either::A(result(Err(()))),
                                             }
                                         });
                                     Either::A(Either::A(future))
