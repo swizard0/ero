@@ -21,7 +21,7 @@ pub fn spawn<FNI, FI, FNA, FA, FNRW, FRW, FNCM, FCM, FNCW, FCW, N, S, R, P, Q>(
     init_state: S,
     mut init_fn: FNI,
     mut aquire_fn: FNA,
-    mut release_fn: FNRW,
+    release_fn: FNRW,
     close_main_fn: FNCM,
     close_wait_fn: FNCW,
 )
@@ -33,7 +33,7 @@ where FNI: FnMut(S) -> FI + Send + 'static,
       FA: IntoFuture<Item = (R, Q), Error = ErrorSeverity<S, ()>> + 'static,
       FA::Future: Send,
       FNRW: FnMut(Q, Option<R>) -> FRW + Send + 'static,
-      FRW: IntoFuture<Item = P, Error = ErrorSeverity<S, ()>> + 'static,
+      FRW: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>> + 'static,
       FRW::Future: Send,
       FNCM: FnMut(P) -> FCM + Send + 'static,
       FCM: IntoFuture<Item = S, Error = ()> + Send + 'static,
@@ -65,11 +65,7 @@ where FNI: FnMut(S) -> FI + Send + 'static,
             error!("something went wrong: release should not be invoked in main loop for lode::uniq");
             future::result(Err(ErrorSeverity::Fatal(())))
         },
-        move |state_q, maybe_resource| {
-            release_fn(state_q, maybe_resource)
-                .into_future()
-                .map(Resource::Available)
-        },
+        release_fn,
         close_main_fn,
         close_wait_fn,
     )
