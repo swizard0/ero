@@ -36,7 +36,15 @@ fn check_sequence() {
     struct ResourceItem;
 
     let (tx, rx) = mpsc::unbounded();
-    let super::Lode { aquire_tx, release_tx, shutdown_tx, } = super::spawn(
+    let super::Lode {
+        resource: super::LodeResource {
+            aquire_tx,
+            release_tx,
+        },
+        shutdown: super::LodeShutdown {
+            shutdown_tx,
+        },
+    } = super::spawn(
         &executor,
         super::Params {
             name: "check_sequence",
@@ -300,7 +308,7 @@ fn lode_stream() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let executor = runtime.executor();
 
-    let lode_stream = super::stream::spawn(
+    let super::Lode { resource: stream_resource, shutdown: stream_shutdown, } = super::stream::spawn(
         &executor,
         super::Params {
             name: "lode_stream",
@@ -312,7 +320,8 @@ fn lode_stream() {
         },
     );
     executor.spawn(
-        lode_stream.steal_resource()
+        stream_resource
+            .steal_resource()
             .and_then(|(item, lode_stream)| {
                 assert_eq!(item, Some(0));
                 lode_stream.steal_resource()
@@ -329,9 +338,9 @@ fn lode_stream() {
                 assert_eq!(item, None);
                 lode_stream.steal_resource()
             })
-            .and_then(|(item, lode_stream)| {
+            .and_then(|(item, _lode_stream)| {
                 assert_eq!(item, Some(0));
-                lode_stream.shutdown();
+                stream_shutdown.shutdown();
                 Ok(())
             })
     );

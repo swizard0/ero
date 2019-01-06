@@ -67,10 +67,18 @@ enum ResourceStatus<R> {
 
 struct Shutdown;
 
-pub struct Lode<R> {
+pub struct LodeShutdown {
+    shutdown_tx: oneshot::Sender<Shutdown>,
+}
+
+pub struct LodeResource<R> {
     aquire_tx: mpsc::Sender<AquireReq<R>>,
     release_tx: mpsc::UnboundedSender<ReleaseReq<R>>,
-    shutdown_tx: oneshot::Sender<Shutdown>,
+}
+
+pub struct Lode<R> {
+    pub resource: LodeResource<R>,
+    pub shutdown: LodeShutdown,
 }
 
 pub enum Resource<P, Q> {
@@ -165,9 +173,13 @@ where FNI: FnMut(S) -> FI + Send + 'static,
     );
 
     Lode {
-        aquire_tx: aquire_tx_stream,
-        release_tx: release_tx_stream,
-        shutdown_tx,
+        resource: LodeResource {
+            aquire_tx: aquire_tx_stream,
+            release_tx: release_tx_stream,
+        },
+        shutdown: LodeShutdown {
+            shutdown_tx,
+        },
     }
 }
 
@@ -758,15 +770,17 @@ pub enum UsingResource<R> {
     Reimburse(R),
 }
 
-impl<R> Lode<R> {
+impl LodeShutdown {
     pub fn shutdown(self) {
         if let Err(..) = self.shutdown_tx.send(Shutdown) {
             warn!("resource task is gone while performing shutdown");
         }
     }
+}
 
-    pub fn steal_resource(self) -> impl Future<Item = (R, Lode<R>), Error = ()> {
-        let Lode { aquire_tx, release_tx, shutdown_tx, } = self;
+impl<R> LodeResource<R> {
+    pub fn steal_resource(self) -> impl Future<Item = (R, LodeResource<R>), Error = ()> {
+        let LodeResource { aquire_tx, release_tx, } = self;
         let (resource_tx, resource_rx) = oneshot::channel();
         aquire_tx
             .send(AquireReq { reply_tx: resource_tx, })
@@ -785,7 +799,7 @@ impl<R> Lode<R> {
                                 warn!("resource task is gone while releasing resource");
                             })
                             .map(move |release_tx| {
-                                (resource, Lode { aquire_tx, release_tx, shutdown_tx, })
+                                (resource, LodeResource { aquire_tx, release_tx, })
                             })
                     })
             })
@@ -796,13 +810,13 @@ impl<R> Lode<R> {
         state: S,
         using_fn: F,
     )
-        -> impl Future<Item = (T, Lode<R>), Error = UsingError<E>>
+        -> impl Future<Item = (T, LodeResource<R>), Error = UsingError<E>>
     where F: FnMut(R, S) -> FI,
           FI: IntoFuture<Item = (UsingResource<R>, Loop<T, S>), Error = ErrorSeverity<S, E>>
     {
         loop_fn(
             (self, using_fn, state),
-            move |(Lode { aquire_tx, release_tx, shutdown_tx, }, mut using_fn, state)| {
+            move |(LodeResource { aquire_tx, release_tx, }, mut using_fn, state)| {
                 debug!("using_resource_loop: aquiring resource");
                 let (resource_tx, resource_rx) = oneshot::channel();
                 aquire_tx
@@ -854,7 +868,7 @@ impl<R> Lode<R> {
                                                         UsingError::ResourceTaskGone
                                                     })
                                                     .map(move |()| {
-                                                        let lode = Lode { aquire_tx, release_tx, shutdown_tx, };
+                                                        let lode = LodeResource { aquire_tx, release_tx, };
                                                         match loop_action {
                                                             Loop::Break(item) =>
                                                                 Loop::Break((item, lode)),
@@ -875,7 +889,7 @@ impl<R> Lode<R> {
                                                         match error {
                                                             ErrorSeverity::Recoverable { state, } =>
                                                                 Ok(Loop::Continue((
-                                                                    Lode { aquire_tx, release_tx, shutdown_tx, },
+                                                                    LodeResource { aquire_tx, release_tx, },
                                                                     using_fn,
                                                                     state,
                                                                 ))),
@@ -896,7 +910,7 @@ impl<R> Lode<R> {
         state: S,
         mut using_fn: F,
     )
-        -> impl Future<Item = (T, Lode<R>), Error = UsingError<E>>
+        -> impl Future<Item = (T, LodeResource<R>), Error = UsingError<E>>
     where F: FnMut(R, S) -> FI,
           FI: IntoFuture<Item = (UsingResource<R>, T), Error = ErrorSeverity<S, E>>
     {
