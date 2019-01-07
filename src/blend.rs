@@ -1,7 +1,3 @@
-use std::{
-    marker::PhantomData,
-};
-
 use futures::{
     Poll,
     Async,
@@ -9,21 +5,16 @@ use futures::{
     Stream,
 };
 
-pub struct Blender<U, V> {
-    _marker: PhantomData<(U, V)>,
-}
+pub struct Blender(());
 
-impl<U, V> Blender<U, V> {
-    pub fn new() -> Blender<U, V> {
-        Blender {
-            _marker: PhantomData,
-        }
+impl Blender {
+    pub fn new() -> Blender {
+        Blender(())
     }
 
-    pub fn add<S, MO, ME>(self, stream: S, map_ok: MO, map_err: ME) -> BlenderNil<U, V, S, MO, ME> {
+    pub fn add<S, MO, ME>(self, stream: S, map_ok: MO, map_err: ME) -> BlenderNil<S, MO, ME> {
         BlenderNil {
             inner: Some(Inner { stream, map_ok, map_err, }),
-            _marker: PhantomData,
         }
     }
 }
@@ -34,33 +25,29 @@ struct Inner<S, MO, ME> {
     map_err: ME,
 }
 
-pub struct BlenderNil<U, V, S, MO, ME> {
+pub struct BlenderNil<S, MO, ME> {
     inner: Option<Inner<S, MO, ME>>,
-    _marker: PhantomData<(U, V)>,
 }
 
-impl<U, V, SS, MOS, MOE> BlenderNil<U, V, SS, MOS, MOE> {
-    pub fn add<S, MO, ME>(self, stream: S, map_ok: MO, map_err: ME) -> BlenderCons<U, V, BlenderNil<U, V, SS, MOS, MOE>, S, MO, ME> {
+impl<SS, MOS, MOE> BlenderNil<SS, MOS, MOE> {
+    pub fn add<S, MO, ME>(self, stream: S, map_ok: MO, map_err: ME) -> BlenderCons<BlenderNil<SS, MOS, MOE>, S, MO, ME> {
         BlenderCons {
             inner: Some(Inner { stream, map_ok, map_err, }),
             cdr: Some(self),
-            _marker: PhantomData,
         }
     }
 }
 
-pub struct BlenderCons<U, V, P, S, MO, ME> {
+pub struct BlenderCons<P, S, MO, ME> {
     inner: Option<Inner<S, MO, ME>>,
     cdr: Option<P>,
-    _marker: PhantomData<(U, V)>,
 }
 
-impl<U, V, P, SS, MOS, MES> BlenderCons<U, V, P, SS, MOS, MES> {
-    pub fn add<S, MO, ME>(self, stream: S, map_ok: MO, map_err: ME) -> BlenderCons<U, V, BlenderCons<U, V, P, SS, MOS, MES>, S, MO, ME> {
+impl<P, SS, MOS, MES> BlenderCons<P, SS, MOS, MES> {
+    pub fn add<S, MO, ME>(self, stream: S, map_ok: MO, map_err: ME) -> BlenderCons<BlenderCons<P, SS, MOS, MES>, S, MO, ME> {
         BlenderCons {
             inner: Some(Inner { stream, map_ok, map_err, }),
             cdr: Some(self),
-            _marker: PhantomData,
         }
     }
 }
@@ -94,7 +81,7 @@ trait TryFuture {
     fn try_poll(&mut self) -> Option<Poll<Self::Item, Self::Error>>;
 }
 
-impl<U, V, S, MO, ME> TryFuture for BlenderNil<U, V, S, MO, ME>
+impl<U, V, S, MO, ME> TryFuture for BlenderNil<S, MO, ME>
 where S: Stream,
       MO: Fn(Option<S::Item>) -> U,
       ME: Fn(S::Error) -> V,
@@ -111,14 +98,14 @@ where S: Stream,
                 Ok(Async::NotReady)
             },
             Ok(Async::Ready(item)) =>
-                Ok(Async::Ready((item, BlenderNil { inner: maybe_inner, _marker: PhantomData, }))),
+                Ok(Async::Ready((item, BlenderNil { inner: maybe_inner, }))),
             Err(error) =>
-                Err((error, BlenderNil { inner: maybe_inner, _marker: PhantomData, })),
+                Err((error, BlenderNil { inner: maybe_inner, })),
         })
     }
 }
 
-impl<U, V, S, MO, ME> Future for BlenderNil<U, V, S, MO, ME>
+impl<U, V, S, MO, ME> Future for BlenderNil<S, MO, ME>
 where S: Stream,
       MO: Fn(Option<S::Item>) -> U,
       ME: Fn(S::Error) -> V,
