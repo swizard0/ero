@@ -4,6 +4,7 @@ use std::time::Duration;
 
 pub use futures::future::Loop;
 
+pub mod blend;
 pub mod lode;
 pub mod net;
 
