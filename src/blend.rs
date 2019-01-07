@@ -282,4 +282,47 @@ mod tests {
         let next = runtime.block_on(blender.map_err(|e| e.0)).unwrap();
         assert!(next.is_none());
     }
+
+    #[test]
+    fn blend_loop() {
+        let stream_a = stream::iter_ok(vec![2, 3, 4]);
+        let stream_b = stream::iter_ok(vec![true, false]);
+        let stream_c = stream::iter_ok(vec!["5"]);
+
+        #[derive(PartialEq, Debug)]
+        enum Var3<A, B, C> { A(A), B(B), C(C), }
+
+        let blender = Blender::new()
+            .add(stream_a, Var3::A, |()| ())
+            .add(stream_b, Var3::B, |()| ())
+            .add(stream_c, Var3::C, |()| ());
+
+        use futures::future::{loop_fn, Loop};
+
+        let future = loop_fn((blender, 0), |(blender, counter)| {
+            blender
+                .map_err(|((), _blender)| ())
+                .map(move |next| {
+                match next {
+                    None =>
+                        Loop::Break(counter),
+                    Some((Var3::A(None), blender)) =>
+                        Loop::Continue((blender, counter)),
+                    Some((Var3::A(Some(value)), blender)) =>
+                        Loop::Continue((blender, counter + value)),
+                    Some((Var3::B(None), blender)) =>
+                        Loop::Continue((blender, counter)),
+                    Some((Var3::B(Some(false)), blender)) =>
+                        Loop::Continue((blender, counter)),
+                    Some((Var3::B(Some(true)), blender)) =>
+                        Loop::Continue((blender, counter + 1)),
+                    Some((Var3::C(None), blender)) =>
+                        Loop::Continue((blender, counter)),
+                    Some((Var3::C(Some(string)), blender)) =>
+                        Loop::Continue((blender, counter + string.parse::<i32>().unwrap())),
+                }
+            })
+        });
+        assert_eq!(future.wait().unwrap(), 15);
+    }
 }
