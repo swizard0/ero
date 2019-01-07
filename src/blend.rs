@@ -74,7 +74,7 @@ impl<U, V, S, MO, ME> Inner<S, MO, ME> where S: Stream, MO: Fn(Option<S::Item>) 
     }
 }
 
-trait TryFuture {
+pub trait TryFuture {
     type Item;
     type Error;
 
@@ -110,46 +110,176 @@ where S: Stream,
       MO: Fn(Option<S::Item>) -> U,
       ME: Fn(S::Error) -> V,
 {
-    type Item = (U, Self);
+    type Item = Option<(U, Self)>;
     type Error = (V, Self);
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        self.try_poll().expect("cannot poll BlenderNil twice")
+        match self.try_poll() {
+            Some(Ok(Async::Ready(item))) =>
+                Ok(Async::Ready(Some(item))),
+            Some(Ok(Async::NotReady)) =>
+                Ok(Async::NotReady),
+            Some(Err(error)) =>
+                Err(error),
+            None =>
+                Ok(Async::Ready(None)),
+        }
     }
 }
 
-// impl<U, V, P, S, MO, ME> TryFuture for BlenderCons<U, V, P, S, MO, ME>
-// where P: TryFuture<Item = (U, P), Error = (V, P)>,
-//       S: Stream,
-//       MO: Fn(Option<S::Item>) -> U,
-//       ME: Fn(S::Error) -> V,
-// {
-//     type Item = (U, Self);
-//     type Error = (V, Self);
+impl<U, V, P, S, MO, ME> TryFuture for BlenderCons<P, S, MO, ME>
+where P: TryFuture<Item = (U, P), Error = (V, P)>,
+      S: Stream,
+      MO: Fn(Option<S::Item>) -> U,
+      ME: Fn(S::Error) -> V,
+{
+    type Item = (U, Self);
+    type Error = (V, Self);
 
-//     fn try_poll(&mut self) -> Option<Poll<Self::Item, Self::Error>> {
-//         let inner = self.inner.take()?;
-//         let mut cdr = self.cdr.take()?;
-//         match cdr.try_poll() {
-//             None | Some(Ok(Async::NotReady)) => {
-//                 unimplemented!()
-//             },
-//             Some(Ok(Async::Ready((item, cdr)))) => {
-//                 let blender = BlenderCons {
-//                     inner: Some(inner),
-//                     cdr: Some(cdr),
-//                     _marker: PhantomData,
-//                 };
-//                 Some(Ok(Async::Ready((item, blender))))
-//             },
-//             Some(Err((error, cdr))) => {
-//                 let blender = BlenderCons {
-//                     inner: Some(inner),
-//                     cdr: Some(cdr),
-//                     _marker: PhantomData,
-//                 };
-//                 Some(Err((error, blender)))
-//             },
-//         }
-//     }
-// }
+    fn try_poll(&mut self) -> Option<Poll<Self::Item, Self::Error>> {
+        let mut cdr = self.cdr.take()?;
+        match cdr.try_poll() {
+            None | Some(Ok(Async::NotReady)) => {
+                let inner = self.inner.take()?;
+                let (poll, maybe_inner) = inner.try_poll_inner();
+                Some(match poll {
+                    Ok(Async::NotReady) => {
+                        self.inner = maybe_inner;
+                        self.cdr = Some(cdr);
+                        Ok(Async::NotReady)
+                    },
+                    Ok(Async::Ready(item)) => {
+                        Ok(Async::Ready((item, BlenderCons { inner: maybe_inner, cdr: Some(cdr), })))
+                    },
+                    Err(error) =>
+                        Err((error, BlenderCons { inner: maybe_inner, cdr: Some(cdr), })),
+                })
+            },
+            Some(Ok(Async::Ready((item, cdr)))) => {
+                let blender = BlenderCons {
+                    inner: self.inner.take(),
+                    cdr: Some(cdr),
+                };
+                Some(Ok(Async::Ready((item, blender))))
+            },
+            Some(Err((error, cdr))) => {
+                let blender = BlenderCons {
+                    inner: self.inner.take(),
+                    cdr: Some(cdr),
+                };
+                Some(Err((error, blender)))
+            },
+        }
+    }
+}
+
+impl<U, V, P, S, MO, ME> Future for BlenderCons<P, S, MO, ME>
+where P: TryFuture<Item = (U, P), Error = (V, P)>,
+      S: Stream,
+      MO: Fn(Option<S::Item>) -> U,
+      ME: Fn(S::Error) -> V,
+{
+    type Item = Option<(U, Self)>;
+    type Error = (V, Self);
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        match self.try_poll() {
+            Some(Ok(Async::Ready(item))) =>
+                Ok(Async::Ready(Some(item))),
+            Some(Ok(Async::NotReady)) =>
+                Ok(Async::NotReady),
+            Some(Err(error)) =>
+                Err(error),
+            None =>
+                Ok(Async::Ready(None)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{
+        Instant,
+        Duration,
+    };
+    use futures::{
+        Future,
+        stream,
+    };
+    use tokio::timer::Delay;
+    use super::Blender;
+
+    #[test]
+    fn blend_3() {
+        let stream_a = stream::iter_ok(vec![0, 1, 2]);
+        let stream_b = stream::iter_ok(vec![true, false]);
+        let stream_c = stream::iter_ok(vec!["5"]);
+
+        #[derive(PartialEq, Debug)]
+        enum Var3<A, B, C> { A(A), B(B), C(C), }
+
+        let blender = Blender::new()
+            .add(stream_a, Var3::A, |()| ())
+            .add(stream_b, Var3::B, |()| ())
+            .add(stream_c, Var3::C, |()| ());
+
+        let (item, blender) = blender.wait().map_err(|e| e.0).unwrap().unwrap();
+        assert_eq!(item, Var3::A(Some(0)));
+        let (item, blender) = blender.wait().map_err(|e| e.0).unwrap().unwrap();
+        assert_eq!(item, Var3::A(Some(1)));
+        let (item, blender) = blender.wait().map_err(|e| e.0).unwrap().unwrap();
+        assert_eq!(item, Var3::A(Some(2)));
+        let (item, blender) = blender.wait().map_err(|e| e.0).unwrap().unwrap();
+        assert_eq!(item, Var3::A(None));
+        let (item, blender) = blender.wait().map_err(|e| e.0).unwrap().unwrap();
+        assert_eq!(item, Var3::B(Some(true)));
+        let (item, blender) = blender.wait().map_err(|e| e.0).unwrap().unwrap();
+        assert_eq!(item, Var3::B(Some(false)));
+        let (item, blender) = blender.wait().map_err(|e| e.0).unwrap().unwrap();
+        assert_eq!(item, Var3::B(None));
+        let (item, blender) = blender.wait().map_err(|e| e.0).unwrap().unwrap();
+        assert_eq!(item, Var3::C(Some("5")));
+        let (item, blender) = blender.wait().map_err(|e| e.0).unwrap().unwrap();
+        assert_eq!(item, Var3::C(None));
+        let next = blender.wait().map_err(|e| e.0).unwrap();
+        assert!(next.is_none());
+    }
+
+    #[test]
+    fn blend_delays() {
+        use futures::{
+            future::Either,
+            stream::futures_unordered,
+        };
+
+        let stream_ok = futures_unordered(vec![
+            Either::A(Delay::new(Instant::now() + Duration::from_millis(200)).map(|_| 0)),
+            Either::B(Delay::new(Instant::now() + Duration::from_millis(100)).map(|_| 1)),
+        ]);
+        let stream_err = futures_unordered(vec![
+            Either::A(Delay::new(Instant::now() + Duration::from_millis(300)).map(|_| "a")),
+            Either::B(Delay::new(Instant::now() + Duration::from_millis(50)).map(|_| "b")),
+        ]);
+
+        let blender = Blender::new()
+            .add(stream_ok, Ok, |x| x)
+            .add(stream_err, Err, |x| x);
+
+        let mut runtime = tokio::runtime::Runtime::new().unwrap();
+
+        let (item, blender) = runtime.block_on(blender.map_err(|e| e.0)).unwrap().unwrap();
+        assert_eq!(item, Err(Some("b")));
+        let (item, blender) = runtime.block_on(blender.map_err(|e| e.0)).unwrap().unwrap();
+        assert_eq!(item, Ok(Some(1)));
+        let (item, blender) = runtime.block_on(blender.map_err(|e| e.0)).unwrap().unwrap();
+        assert_eq!(item, Ok(Some(0)));
+        let (item, blender) = runtime.block_on(blender.map_err(|e| e.0)).unwrap().unwrap();
+        assert_eq!(item, Ok(None));
+        let (item, blender) = runtime.block_on(blender.map_err(|e| e.0)).unwrap().unwrap();
+        assert_eq!(item, Err(Some("a")));
+        let (item, blender) = runtime.block_on(blender.map_err(|e| e.0)).unwrap().unwrap();
+        assert_eq!(item, Err(None));
+        let next = runtime.block_on(blender.map_err(|e| e.0)).unwrap();
+        assert!(next.is_none());
+    }
+}
