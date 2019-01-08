@@ -1,3 +1,5 @@
+use std::mem;
+
 use futures::{
     Poll,
     Async,
@@ -14,61 +16,113 @@ impl Blender {
 
     pub fn add<S, MO, ME>(self, stream: S, map_ok: MO, map_err: ME) -> BlenderNil<S, MO, ME> {
         BlenderNil {
-            inner: Some(Inner { stream, map_ok, map_err, }),
+            inner: Inner::Active { stream, map_ok, map_err, },
         }
     }
 }
 
-struct Inner<S, MO, ME> {
-    stream: S,
-    map_ok: MO,
-    map_err: ME,
+enum Inner<S, MO, ME> {
+    Taken,
+    Active {
+        stream: S,
+        map_ok: MO,
+        map_err: ME,
+    },
+    Disabled {
+        stream: S,
+    },
 }
 
 pub struct BlenderNil<S, MO, ME> {
-    inner: Option<Inner<S, MO, ME>>,
+    inner: Inner<S, MO, ME>,
 }
 
 impl<SS, MOS, MOE> BlenderNil<SS, MOS, MOE> {
     pub fn add<S, MO, ME>(self, stream: S, map_ok: MO, map_err: ME) -> BlenderCons<BlenderNil<SS, MOS, MOE>, S, MO, ME> {
         BlenderCons {
-            inner: Some(Inner { stream, map_ok, map_err, }),
+            inner: Inner::Active { stream, map_ok, map_err, },
             cdr: Some(self),
         }
     }
 }
 
 pub struct BlenderCons<P, S, MO, ME> {
-    inner: Option<Inner<S, MO, ME>>,
+    inner: Inner<S, MO, ME>,
     cdr: Option<P>,
 }
 
 impl<P, SS, MOS, MES> BlenderCons<P, SS, MOS, MES> {
     pub fn add<S, MO, ME>(self, stream: S, map_ok: MO, map_err: ME) -> BlenderCons<BlenderCons<P, SS, MOS, MES>, S, MO, ME> {
         BlenderCons {
-            inner: Some(Inner { stream, map_ok, map_err, }),
+            inner: Inner::Active { stream, map_ok, map_err, },
             cdr: Some(self),
         }
     }
 }
 
+pub trait Decompose {
+    type Parts;
+
+    fn decompose(self) -> Self::Parts;
+}
+
+impl<S, MO, ME> Decompose for BlenderNil<S, MO, ME> {
+    type Parts = S;
+
+    fn decompose(self) -> Self::Parts {
+        self.inner.into_stream()
+    }
+}
+
+impl<P, S, MO, ME> Decompose for BlenderCons<P, S, MO, ME> where P: Decompose {
+    type Parts = (S, P::Parts);
+
+    fn decompose(self) -> Self::Parts {
+        (
+            self.inner.into_stream(),
+            self.cdr.expect("decomposing already triggered BlendCons").decompose()
+        )
+    }
+}
+
+impl<S, MO, ME> Inner<S, MO, ME> {
+    fn into_stream(self) -> S {
+        match self {
+            Inner::Active { stream, .. } | Inner::Disabled { stream, } =>
+                stream,
+            Inner::Taken =>
+                panic!("decomposing already triggered Blend"),
+        }
+    }
+}
+
 impl<U, V, S, MO, ME> Inner<S, MO, ME> where S: Stream, MO: Fn(Option<S::Item>) -> U, ME: Fn(S::Error) -> V {
-    fn try_poll_inner(mut self) -> (Poll<U, V>, Option<Self>) {
-        match self.stream.poll() {
-            Ok(Async::NotReady) => {
-                (Ok(Async::NotReady), Some(self))
-            },
-            Ok(Async::Ready(Some(item))) => {
-                let item = (self.map_ok)(Some(item));
-                (Ok(Async::Ready(item)), Some(self))
-            },
-            Ok(Async::Ready(None)) => {
-                let item = (self.map_ok)(None);
-                (Ok(Async::Ready(item)), None)
-            },
-            Err(error) => {
-                let error = (self.map_err)(error);
-                (Err(error), None)
+    fn try_poll_inner(&mut self) -> Option<Poll<(U, Self), (V, Self)>> {
+        match mem::replace(self, Inner::Taken) {
+            Inner::Active { mut stream, map_ok, map_err, } =>
+                Some(match stream.poll() {
+                    Ok(Async::NotReady) => {
+                        *self = Inner::Active { stream, map_ok, map_err, };
+                        Ok(Async::NotReady)
+                    },
+                    Ok(Async::Ready(Some(item))) => {
+                        let item = map_ok(Some(item));
+                        Ok(Async::Ready((item, Inner::Active { stream, map_ok, map_err, })))
+                    },
+                    Ok(Async::Ready(None)) => {
+                        let item = map_ok(None);
+                        Ok(Async::Ready((item, Inner::Disabled { stream, })))
+                    },
+                    Err(error) => {
+                        let error = map_err(error);
+                        Err((error, Inner::Disabled { stream, }))
+                    },
+                }),
+            Inner::Taken =>
+                panic!("cannot poll Blend twice"),
+            inner @ Inner::Disabled { .. } => {
+                *self = inner;
+                None
             },
         }
     }
@@ -90,17 +144,13 @@ where S: Stream,
     type Error = (V, Self);
 
     fn try_poll(&mut self) -> Option<Poll<Self::Item, Self::Error>> {
-        let inner = self.inner.take()?;
-        let (poll, maybe_inner) = inner.try_poll_inner();
-        Some(match poll {
-            Ok(Async::NotReady) => {
-                self.inner = maybe_inner;
-                Ok(Async::NotReady)
-            },
-            Ok(Async::Ready(item)) =>
-                Ok(Async::Ready((item, BlenderNil { inner: maybe_inner, }))),
-            Err(error) =>
-                Err((error, BlenderNil { inner: maybe_inner, })),
+        Some(match self.inner.try_poll_inner()? {
+            Ok(Async::NotReady) =>
+                Ok(Async::NotReady),
+            Ok(Async::Ready((item, inner))) =>
+                Ok(Async::Ready((item, BlenderNil { inner, }))),
+            Err((error, inner)) =>
+                Err((error, BlenderNil { inner, })),
         })
     }
 }
@@ -140,31 +190,27 @@ where P: TryFuture<Item = (U, P), Error = (V, P)>,
         let mut cdr = self.cdr.take()?;
         match cdr.try_poll() {
             None | Some(Ok(Async::NotReady)) => {
-                let inner = self.inner.take()?;
-                let (poll, maybe_inner) = inner.try_poll_inner();
-                Some(match poll {
+                Some(match self.inner.try_poll_inner()? {
                     Ok(Async::NotReady) => {
-                        self.inner = maybe_inner;
                         self.cdr = Some(cdr);
                         Ok(Async::NotReady)
                     },
-                    Ok(Async::Ready(item)) => {
-                        Ok(Async::Ready((item, BlenderCons { inner: maybe_inner, cdr: Some(cdr), })))
-                    },
-                    Err(error) =>
-                        Err((error, BlenderCons { inner: maybe_inner, cdr: Some(cdr), })),
+                    Ok(Async::Ready((item, inner))) =>
+                        Ok(Async::Ready((item, BlenderCons { inner, cdr: Some(cdr), }))),
+                    Err((error, inner)) =>
+                        Err((error, BlenderCons { inner, cdr: Some(cdr), })),
                 })
             },
             Some(Ok(Async::Ready((item, cdr)))) => {
                 let blender = BlenderCons {
-                    inner: self.inner.take(),
+                    inner: mem::replace(&mut self.inner, Inner::Taken),
                     cdr: Some(cdr),
                 };
                 Some(Ok(Async::Ready((item, blender))))
             },
             Some(Err((error, cdr))) => {
                 let blender = BlenderCons {
-                    inner: self.inner.take(),
+                    inner: mem::replace(&mut self.inner, Inner::Taken),
                     cdr: Some(cdr),
                 };
                 Some(Err((error, blender)))
