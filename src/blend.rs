@@ -281,6 +281,7 @@ mod gen {
         },
         Disabled {
             gen: G,
+            next: N,
         },
     }
 
@@ -325,7 +326,7 @@ mod gen {
     }
 
     impl<G, N, MO, ME> super::Decompose for Nil<G, N, MO, ME> {
-        type Parts = G;
+        type Parts = (G, N);
 
         fn decompose(self) -> Self::Parts {
             self.inner.into_gen_future()
@@ -333,7 +334,7 @@ mod gen {
     }
 
     impl<P, G, N, MO, ME> super::Decompose for Cons<P, G, N, MO, ME> where P: super::Decompose {
-        type Parts = (G, P::Parts);
+        type Parts = ((G, N), P::Parts);
 
         fn decompose(self) -> Self::Parts {
             (
@@ -344,10 +345,10 @@ mod gen {
     }
 
     impl<G, N, MO, ME> Inner<G, N, MO, ME> {
-        fn into_gen_future(self) -> G {
+        fn into_gen_future(self) -> (G, N) {
             match self {
-                Inner::Active { gen, .. } | Inner::Disabled { gen, } =>
-                    gen,
+                Inner::Active { gen, next, .. } | Inner::Disabled { gen, next, } =>
+                    (gen, next),
                 Inner::Taken =>
                     panic!("decomposing already triggered blend::gen::Inner"),
             }
@@ -376,12 +377,12 @@ mod gen {
                         Ok(Async::Ready((None, kont))) => {
                             let item = map_ok(None);
                             mem::replace(&mut gen, next(kont));
-                            Ok(Async::Ready((item, Inner::Disabled { gen, })))
+                            Ok(Async::Ready((item, Inner::Disabled { gen, next, })))
                         },
                         Err((error, kont)) => {
                             let error = map_err(error);
                             mem::replace(&mut gen, next(kont));
-                            Err((error, Inner::Disabled { gen, }))
+                            Err((error, Inner::Disabled { gen, next, }))
                         },
                     }),
                 Inner::Taken =>
