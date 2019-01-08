@@ -369,8 +369,8 @@ where FNA: FnMut(P) -> FA,
 {
     let OuterState { peers, core, state_avail, aquire_req_pending, } = outer_state;
     let blender = Blender::new()
-        .add(peers.aquire_rx, Either::A, Either::A)
-        .add(peers.release_rx, Either::B, Either::B);
+        .add_stream(peers.aquire_rx, Either::A, Either::A)
+        .add_stream(peers.release_rx, Either::B, Either::B);
     loop_fn(MainState { blender, core, state_avail, aquire_req_pending, }, main_loop)
         .and_then(move |main_loop_result| {
             match main_loop_result {
