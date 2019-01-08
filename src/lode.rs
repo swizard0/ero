@@ -10,7 +10,6 @@ use futures::{
         result,
         Either,
     },
-    stream::StreamFuture,
     sync::{
         mpsc,
         oneshot,
@@ -34,6 +33,10 @@ use super::{
     Loop,
     ErrorSeverity,
     RestartStrategy,
+    blend::{
+        Blender,
+        Decompose,
+    },
 };
 
 pub mod uniq;
@@ -70,6 +73,9 @@ struct Shutdown;
 pub struct LodeShutdown {
     shutdown_tx: oneshot::Sender<Shutdown>,
 }
+
+type AquirePeer<R> = mpsc::Receiver<AquireReq<R>>;
+type ReleasePeer<R> = mpsc::UnboundedReceiver<ReleaseReq<R>>;
 
 pub struct LodeResource<R> {
     aquire_tx: mpsc::Sender<AquireReq<R>>,
@@ -133,9 +139,11 @@ where FNI: FnMut(S) -> FI + Send + 'static,
 
     let task_future = loop_fn(
         RestartState {
+            peers: Peers {
+                aquire_rx: aquire_rx_stream,
+                release_rx: release_rx_stream,
+            },
             core: Core {
-                aquire_rx: aquire_rx_stream.into_future(),
-                release_rx: release_rx_stream.into_future(),
                 aquires_count: 0,
                 generation: 0,
                 params,
@@ -191,9 +199,12 @@ struct VTable<FNA, FNRM, FNRW, FNCM, FNCW> {
     close_wait_fn: FNCW,
 }
 
-struct Core<FNA, FNRM, FNRW, FNCM, FNCW, N, R> {
-    aquire_rx: StreamFuture<mpsc::Receiver<AquireReq<R>>>,
-    release_rx: StreamFuture<mpsc::UnboundedReceiver<ReleaseReq<R>>>,
+struct Peers<R> {
+    aquire_rx: AquirePeer<R>,
+    release_rx: ReleasePeer<R>,
+}
+
+struct Core<FNA, FNRM, FNRW, FNCM, FNCW, N> {
     params: Params<N>,
     vtable: VTable<FNA, FNRM, FNRW, FNCM, FNCW>,
     aquires_count: usize,
@@ -201,7 +212,8 @@ struct Core<FNA, FNRM, FNRW, FNCM, FNCW, N, R> {
 }
 
 struct RestartState<FNI, FNA, FNRM, FNRW, FNCM, FNCW, N, S, R> {
-    core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N, R>,
+    peers: Peers<R>,
+    core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N>,
     aquire_req_pending: Option<AquireReq<R>>,
     init_state: S,
     init_fn: FNI,
@@ -225,16 +237,16 @@ where FNI: FnMut(S) -> FS + Send + 'static,
       FCW: IntoFuture<Item = S, Error = ()>,
       N: AsRef<str>,
 {
-    let RestartState { core, init_state, mut init_fn, mut aquire_req_pending, } = restart_state;
+    let RestartState { peers, mut core, init_state, mut init_fn, mut aquire_req_pending, } = restart_state;
     let future = if let Some(aquire_req) = aquire_req_pending.take() {
-        Either::A(result(Ok(AquireWait::Arrived { aquire_req, core, })))
+        Either::A(result(Ok(AquireWait::Arrived { aquire_req, peers, })))
     } else {
-        Either::B(wait_for_aquire(core))
+        Either::B(wait_for_aquire(peers))
     };
     future
         .and_then(move |aquire_wait| {
             match aquire_wait {
-                AquireWait::Arrived { aquire_req, mut core, } => {
+                AquireWait::Arrived { aquire_req, peers, } => {
                     let future = init_fn(init_state)
                         .into_future()
                         .then(move |maybe_lode_state| {
@@ -242,14 +254,14 @@ where FNI: FnMut(S) -> FS + Send + 'static,
                                 Ok(Resource::Available(state_avail)) => {
                                     core.generation += 1;
                                     let future =
-                                        loop_fn(OuterState { core, state_avail, aquire_req_pending: Some(aquire_req), }, outer_loop)
+                                        loop_fn(OuterState { peers, core, state_avail, aquire_req_pending: Some(aquire_req), }, outer_loop)
                                         .then(move |inner_loop_result| {
                                             match inner_loop_result {
                                                 Ok(BreakOuter::Shutdown) =>
                                                     Either::A(result(Ok(Loop::Break(())))),
-                                                Ok(BreakOuter::RequireRestart { core, init_state, aquire_req_pending, }) => {
+                                                Ok(BreakOuter::RequireRestart { peers, core, init_state, aquire_req_pending, }) => {
                                                     let future = proceed_with_restart(RestartState {
-                                                        core, init_state, init_fn, aquire_req_pending,
+                                                        peers, core, init_state, init_fn, aquire_req_pending,
                                                     });
                                                     Either::B(future)
                                                 },
@@ -266,7 +278,7 @@ where FNI: FnMut(S) -> FS + Send + 'static,
                                         .and_then(move |init_state| {
                                             proceed_with_restart(RestartState {
                                                 aquire_req_pending: Some(aquire_req),
-                                                core, init_state, init_fn,
+                                                peers, core, init_state, init_fn,
                                             })
                                         });
                                     Either::A(Either::B(future))
@@ -274,7 +286,7 @@ where FNI: FnMut(S) -> FS + Send + 'static,
                                 Err(ErrorSeverity::Recoverable { state: init_state, }) => {
                                     let future = proceed_with_restart(RestartState {
                                         aquire_req_pending: Some(aquire_req),
-                                        core, init_state, init_fn,
+                                        peers, core, init_state, init_fn,
                                     });
                                     Either::B(Either::A(future))
                                 },
@@ -292,35 +304,29 @@ where FNI: FnMut(S) -> FS + Send + 'static,
         })
 }
 
-enum AquireWait<FNA, FNRM, FNRW, FNCM, FNCW, N, R> {
-    Arrived { aquire_req: AquireReq<R>, core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N, R>, },
+enum AquireWait<R> {
+    Arrived { aquire_req: AquireReq<R>, peers: Peers<R>, },
     Shutdown,
 }
 
-fn wait_for_aquire<FNA, FNRM, FNRW, FNCM, FNCW, N, R>(
-    core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N, R>
-)
-    -> impl Future<Item = AquireWait<FNA, FNRM, FNRW, FNCM, FNCW, N, R>, Error = ()>
-{
-    let Core { aquire_rx, release_rx, params, vtable, aquires_count, generation, } = core;
+fn wait_for_aquire<R>(peers: Peers<R>) -> impl Future<Item = AquireWait<R>, Error = ()> {
+    let Peers { aquire_rx, release_rx, } = peers;
     aquire_rx
+        .into_future()
         .then(move |await_result| {
             match await_result {
-                Ok((Some(aquire_req), aquire_rx_stream)) => {
+                Ok((Some(aquire_req), aquire_rx)) => {
                     debug!("wait_for_aquire: aquire request");
                     Ok(AquireWait::Arrived {
                         aquire_req,
-                        core: Core {
-                            aquire_rx: aquire_rx_stream.into_future(),
-                            release_rx, params, vtable, aquires_count, generation,
-                        },
+                        peers: Peers { aquire_rx, release_rx, },
                     })
                 },
-                Ok((None, _aquire_rx_stream)) => {
+                Ok((None, _aquire_rx)) => {
                     debug!("wait_for_aquire: release channel depleted");
                     Ok(AquireWait::Shutdown)
                 },
-                Err(((), _aquire_rx_stream)) => {
+                Err(((), _aquire_rx)) => {
                     debug!("wait_for_aquire: aquire channel outer endpoint dropped");
                     Ok(AquireWait::Shutdown)
                 },
@@ -331,14 +337,16 @@ fn wait_for_aquire<FNA, FNRM, FNRW, FNCM, FNCW, N, R>(
 enum BreakOuter<FNA, FNRM, FNRW, FNCM, FNCW, N, S, R> {
     Shutdown,
     RequireRestart {
-        core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N, R>,
+        peers: Peers<R>,
+        core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N>,
         init_state: S,
         aquire_req_pending: Option<AquireReq<R>>,
     },
 }
 
 struct OuterState<FNA, FNRM, FNRW, FNCM, FNCW, N, R, P> {
-    core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N, R>,
+    peers: Peers<R>,
+    core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N>,
     state_avail: P,
     aquire_req_pending: Option<AquireReq<R>>,
 }
@@ -359,25 +367,36 @@ where FNA: FnMut(P) -> FA,
       FCW: IntoFuture<Item = S, Error = ()>,
       N: AsRef<str>,
 {
-    let OuterState { core, state_avail, aquire_req_pending, } = outer_state;
-
-    loop_fn(MainState { core, state_avail, aquire_req_pending, }, main_loop)
+    let OuterState { peers, core, state_avail, aquire_req_pending, } = outer_state;
+    let blender = Blender::new()
+        .add(peers.aquire_rx, Either::A, Either::A)
+        .add(peers.release_rx, Either::B, Either::B);
+    loop_fn(MainState { blender, core, state_avail, aquire_req_pending, }, main_loop)
         .and_then(move |main_loop_result| {
             match main_loop_result {
                 BreakMain::Shutdown =>
                     Either::A(result(Ok(Loop::Break(BreakOuter::Shutdown)))),
-                BreakMain::RequireRestart { core, init_state, aquire_req_pending, } =>
-                    Either::A(result(Ok(Loop::Break(BreakOuter::RequireRestart { core, init_state, aquire_req_pending, })))),
-                BreakMain::WaitRelease { core, state_no_left, } => {
-                    let future = loop_fn(WaitState { core, state_no_left, }, wait_loop)
+                BreakMain::RequireRestart { peers, core, init_state, aquire_req_pending, } =>
+                    Either::A(result(Ok(Loop::Break(BreakOuter::RequireRestart { peers, core, init_state, aquire_req_pending, })))),
+                BreakMain::WaitRelease { peers, core, state_no_left, } => {
+                    let Peers { aquire_rx, release_rx, } = peers;
+                    let future = loop_fn(WaitState { release_rx, core, state_no_left, }, wait_loop)
                         .map(move |wait_loop_result| {
                             match wait_loop_result {
                                 BreakWait::Shutdown =>
                                     Loop::Break(BreakOuter::Shutdown),
-                                BreakWait::RequireRestart { core, init_state, } =>
-                                    Loop::Break(BreakOuter::RequireRestart { core, init_state, aquire_req_pending: None, }),
-                                BreakWait::ProceedMain { core, state_avail, } =>
-                                    Loop::Continue(OuterState { core, state_avail, aquire_req_pending: None, }),
+                                BreakWait::RequireRestart { release_rx, core, init_state, } =>
+                                    Loop::Break(BreakOuter::RequireRestart {
+                                        peers: Peers { aquire_rx, release_rx, },
+                                        aquire_req_pending: None,
+                                        core, init_state,
+                                    }),
+                                BreakWait::ProceedMain { release_rx, core, state_avail, } =>
+                                    Loop::Continue(OuterState {
+                                        peers: Peers { aquire_rx, release_rx, },
+                                        aquire_req_pending: None,
+                                        core, state_avail,
+                                    }),
                             }
                         });
                     Either::B(future)
@@ -389,26 +408,29 @@ where FNA: FnMut(P) -> FA,
 enum BreakMain<FNA, FNRM, FNRW, FNCM, FNCW, N, S, R, Q> {
     Shutdown,
     RequireRestart {
-        core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N, R>,
+        peers: Peers<R>,
+        core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N>,
         init_state: S,
         aquire_req_pending: Option<AquireReq<R>>,
     },
     WaitRelease {
-        core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N, R>,
+        peers: Peers<R>,
+        core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N>,
         state_no_left: Q,
     },
 }
 
-struct MainState<FNA, FNRM, FNRW, FNCM, FNCW, N, R, P> {
-    core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N, R>,
+struct MainState<FNA, FNRM, FNRW, FNCM, FNCW, N, R, P, B> {
+    blender: B,
+    core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N>,
     state_avail: P,
     aquire_req_pending: Option<AquireReq<R>>,
 }
 
-fn main_loop<FNA, FA, FNRM, FRM, FNRW, FRW, FNCM, FCM, FNCW, FCW, N, S, R, P, Q>(
-    main_state: MainState<FNA, FNRM, FNRW, FNCM, FNCW, N, R, P>,
+fn main_loop<FNA, FA, FNRM, FRM, FNRW, FRW, FNCM, FCM, FNCW, FCW, N, S, R, P, Q, B>(
+    main_state: MainState<FNA, FNRM, FNRW, FNCM, FNCW, N, R, P, B>,
 )
-    -> impl Future<Item = Loop<BreakMain<FNA, FNRM, FNRW, FNCM, FNCW, N, S, R, Q>, MainState<FNA, FNRM, FNRW, FNCM, FNCW, N, R, P>>, Error = ()>
+    -> impl Future<Item = Loop<BreakMain<FNA, FNRM, FNRW, FNCM, FNCW, N, S, R, Q>, MainState<FNA, FNRM, FNRW, FNCM, FNCW, N, R, P, B>>, Error = ()>
 where FNA: FnMut(P) -> FA,
       FA: IntoFuture<Item = (R, Resource<P, Q>), Error = ErrorSeverity<S, ()>>,
       FNRM: FnMut(P, Option<R>) -> FRM,
@@ -420,18 +442,21 @@ where FNA: FnMut(P) -> FA,
       FNCW: FnMut(Q) -> FCW,
       FCW: IntoFuture<Item = S, Error = ()>,
       N: AsRef<str>,
+      B: Future<Item = Option<(Either<Option<AquireReq<R>>, Option<ReleaseReq<R>>>, B)>, Error = (Either<(), ()>, B)>
+    + Decompose<Parts = (ReleasePeer<R>, AquirePeer<R>)>,
 {
     let MainState {
-        core: Core { aquire_rx, release_rx, params, mut vtable, aquires_count, generation, },
+        core: Core { params, mut vtable, aquires_count, generation, },
+        blender,
         state_avail,
         aquire_req_pending,
     } = main_state;
 
     enum AquireProcess<FNA, FNRM, FNRW, FNCM, FNCW, N, S, R, P, Q> {
-        Proceed { core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N, R>, state_avail: P, },
-        WaitRelease { core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N, R>, state_no_left: Q, },
+        Proceed { core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N>, state_avail: P, },
+        WaitRelease { core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N>, state_no_left: Q, },
         RequireRestart {
-            core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N, R>,
+            core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N>,
             init_state: S,
             aquire_req_pending: Option<AquireReq<R>>,
         }
@@ -452,7 +477,7 @@ where FNA: FnMut(P) -> FA,
                                 aquires_count
                             },
                         };
-                        let core = Core { aquire_rx, release_rx, params, vtable, aquires_count, generation, };
+                        let core = Core { params, vtable, aquires_count, generation, };
                         match resource_status {
                             Resource::Available(state_avail) =>
                                 Ok(AquireProcess::Proceed { core, state_avail, }),
@@ -463,9 +488,7 @@ where FNA: FnMut(P) -> FA,
                     },
                     Err(ErrorSeverity::Recoverable { state: init_state, }) => {
                         Ok(AquireProcess::RequireRestart {
-                            core: Core {
-                                aquire_rx, release_rx, params, vtable, aquires_count, generation,
-                            },
+                            core: Core { params, vtable, aquires_count, generation, },
                             aquire_req_pending: Some(AquireReq { reply_tx, }),
                             init_state,
                         })
@@ -479,38 +502,33 @@ where FNA: FnMut(P) -> FA,
         Either::A(future)
     } else {
         Either::B(result(Ok(AquireProcess::Proceed {
-            core: Core {
-                aquire_rx, release_rx, params, vtable, aquires_count, generation,
-            },
+            core: Core { params, vtable, aquires_count, generation, },
             state_avail,
         })))
     };
 
     future
-        .and_then(|aquire_process| {
+        .and_then(move |aquire_process| {
             match aquire_process {
                 AquireProcess::Proceed { core, state_avail, } => {
-                    let Core { aquire_rx, release_rx, params, mut vtable, aquires_count, generation, } = core;
-                    let future = aquire_rx
-                        .select2(release_rx)
+                    let Core { params, mut vtable, aquires_count, generation, } = core;
+                    let future = blender
                         .then(move |await_result| {
                             match await_result {
-                                Ok(Either::A(((Some(aquire_req), aquire_rx_stream), release_rx))) => {
+                                Ok(Some((Either::A(Some(aquire_req)), blender))) => {
                                     debug!("main_loop: aquire request");
                                     Either::B(result(Ok(Loop::Continue(MainState {
-                                        core: Core {
-                                            aquire_rx: aquire_rx_stream.into_future(),
-                                            release_rx, params, vtable, aquires_count, generation,
-                                        },
-                                        state_avail,
+                                        core: Core { params, vtable, aquires_count, generation, },
                                         aquire_req_pending: Some(aquire_req),
+                                        blender,
+                                        state_avail,
                                     }))))
                                 },
-                                Ok(Either::A(((None, _aquire_rx_stream), _release_rx))) => {
+                                Ok(Some((Either::A(None), _blender))) => {
                                     debug!("main_loop: aquire channel depleted");
                                     Either::B(result(Ok(Loop::Break(BreakMain::Shutdown))))
                                 },
-                                Ok(Either::B(((Some(release_req), release_rx_stream), aquire_rx))) => {
+                                Ok(Some((Either::B(Some(release_req)), blender))) => {
                                     if release_req.generation == generation {
                                         let maybe_resource = match release_req.status {
                                             ResourceStatus::Reimburse(resource) => {
@@ -532,17 +550,24 @@ where FNA: FnMut(P) -> FA,
                                                 .into_future()
                                                 .then(move |release_result| {
                                                     let core = Core {
-                                                        release_rx: release_rx_stream.into_future(),
                                                         aquires_count: if aquires_count > 0 { aquires_count - 1 } else { 0 },
-                                                        aquire_rx, params, vtable, generation,
+                                                        params, vtable, generation,
                                                     };
                                                     match release_result {
                                                         Ok(Resource::Available(state_avail)) =>
-                                                            Ok(Loop::Continue(MainState { core, state_avail, aquire_req_pending: None, })),
-                                                        Ok(Resource::OutOfStock(state_no_left)) =>
-                                                            Ok(Loop::Break(BreakMain::WaitRelease { core, state_no_left, })),
-                                                        Err(ErrorSeverity::Recoverable { state: init_state, }) =>
-                                                            Ok(Loop::Break(BreakMain::RequireRestart { core, init_state, aquire_req_pending: None, })),
+                                                            Ok(Loop::Continue(MainState { blender, core, state_avail, aquire_req_pending: None, })),
+                                                        Ok(Resource::OutOfStock(state_no_left)) => {
+                                                            let (release_rx, aquire_rx) = blender.decompose();
+                                                            let peers = Peers { aquire_rx, release_rx, };
+                                                            Ok(Loop::Break(BreakMain::WaitRelease { peers, core, state_no_left, }))
+                                                        },
+                                                        Err(ErrorSeverity::Recoverable { state: init_state, }) => {
+                                                            let (release_rx, aquire_rx) = blender.decompose();
+                                                            let peers = Peers { aquire_rx, release_rx, };
+                                                            Ok(Loop::Break(BreakMain::RequireRestart {
+                                                                peers, core, init_state, aquire_req_pending: None,
+                                                            }))
+                                                        },
                                                         Err(ErrorSeverity::Fatal(())) => {
                                                             error!("{} crashed with fatal error, terminating", core.params.name.as_ref());
                                                             Err(())
@@ -556,14 +581,16 @@ where FNA: FnMut(P) -> FA,
                                             let future = (vtable.close_main_fn)(state_avail)
                                                 .into_future()
                                                 .map(move |init_state| {
+                                                    let (release_rx, aquire_rx) = blender.decompose();
+                                                    let peers = Peers { aquire_rx, release_rx, };
                                                     Loop::Break(BreakMain::RequireRestart {
                                                         core: Core {
-                                                            release_rx: release_rx_stream.into_future(),
                                                             aquires_count: if aquires_count > 0 { aquires_count - 1 } else { 0 },
-                                                            aquire_rx, params, vtable, generation,
+                                                            params, vtable, generation,
                                                         },
-                                                        init_state,
                                                         aquire_req_pending: None,
+                                                        init_state,
+                                                        peers,
                                                     })
                                                 });
                                             Either::B(future)
@@ -572,24 +599,26 @@ where FNA: FnMut(P) -> FA,
                                     } else {
                                         debug!("main_loop: skipping obsolete release request");
                                         Either::B(result(Ok(Loop::Continue(MainState {
-                                            core: Core {
-                                                release_rx: release_rx_stream.into_future(),
-                                                aquire_rx, params, vtable, aquires_count, generation,
-                                            },
-                                            state_avail,
+                                            core: Core { params, vtable, aquires_count, generation, },
                                             aquire_req_pending: None,
+                                            state_avail,
+                                            blender,
                                         }))))
                                     }
                                 },
-                                Ok(Either::B(((None, _release_rx_stream), _aquire_rx))) => {
+                                Ok(Some((Either::B(None), _blender))) => {
                                     debug!("main_loop: release channel depleted");
                                     Either::B(result(Ok(Loop::Break(BreakMain::Shutdown))))
                                 },
-                                Err(Either::A((((), _aquire_rx), _release_rx))) => {
+                                Ok(None) => {
+                                    error!("main_loop: channels blender exhausted");
+                                    Either::B(result(Ok(Loop::Break(BreakMain::Shutdown))))
+                                },
+                                Err((Either::A(()), _blender)) => {
                                     debug!("main_loop: aquire channel outer endpoint dropped");
                                     Either::B(result(Ok(Loop::Break(BreakMain::Shutdown))))
                                 },
-                                Err(Either::B((((), _release_rx), _aquire_rx))) => {
+                                Err((Either::B(()), _blender)) => {
                                     debug!("main_loop: release channel outer endpoint dropped");
                                     Either::B(result(Ok(Loop::Break(BreakMain::Shutdown))))
                                 },
@@ -597,10 +626,16 @@ where FNA: FnMut(P) -> FA,
                         });
                     Either::A(future)
                 },
-                AquireProcess::WaitRelease { core, state_no_left, } =>
-                    Either::B(result(Ok(Loop::Break(BreakMain::WaitRelease { core, state_no_left, })))),
-                AquireProcess::RequireRestart { core, init_state, aquire_req_pending, } =>
-                    Either::B(result(Ok(Loop::Break(BreakMain::RequireRestart { core, init_state, aquire_req_pending, })))),
+                AquireProcess::WaitRelease { core, state_no_left, } => {
+                    let (release_rx, aquire_rx) = blender.decompose();
+                    let peers = Peers { aquire_rx, release_rx, };
+                    Either::B(result(Ok(Loop::Break(BreakMain::WaitRelease { peers, core, state_no_left, }))))
+                },
+                AquireProcess::RequireRestart { core, init_state, aquire_req_pending, } => {
+                    let (release_rx, aquire_rx) = blender.decompose();
+                    let peers = Peers { aquire_rx, release_rx, };
+                    Either::B(result(Ok(Loop::Break(BreakMain::RequireRestart { peers, core, init_state, aquire_req_pending, }))))
+                },
             }
         })
 }
@@ -608,17 +643,20 @@ where FNA: FnMut(P) -> FA,
 enum BreakWait<FNA, FNRM, FNRW, FNCM, FNCW, N, S, R, P> {
     Shutdown,
     RequireRestart {
-        core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N, R>,
+        release_rx: ReleasePeer<R>,
+        core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N>,
         init_state: S,
     },
     ProceedMain {
-        core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N, R>,
+        release_rx: ReleasePeer<R>,
+        core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N>,
         state_avail: P,
     },
 }
 
 struct WaitState<FNA, FNRM, FNRW, FNCM, FNCW, N, R, Q> {
-    core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N, R>,
+    release_rx: ReleasePeer<R>,
+    core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N>,
     state_no_left: Q,
 }
 
@@ -639,14 +677,16 @@ where FNA: FnMut(P) -> FA,
       N: AsRef<str>,
 {
     let WaitState {
-        core: Core { aquire_rx, release_rx, params, mut vtable, aquires_count, generation, },
+        core: Core { params, mut vtable, aquires_count, generation, },
+        release_rx,
         state_no_left,
     } = wait_state;
 
     release_rx
+        .into_future()
         .then(move |await_result| {
             match await_result {
-                Ok((Some(ReleaseReq { generation: release_gen, status, }), release_rx_stream)) => {
+                Ok((Some(ReleaseReq { generation: release_gen, status, }), release_rx)) => {
                     if release_gen == generation {
                         let maybe_resource = match status {
                             ResourceStatus::Reimburse(resource) => {
@@ -668,31 +708,30 @@ where FNA: FnMut(P) -> FA,
                                 .into_future()
                                 .then(move |release_result| {
                                     let mut core = Core {
-                                        release_rx: release_rx_stream.into_future(),
                                         aquires_count: if aquires_count > 0 { aquires_count - 1 } else { 0 },
-                                        aquire_rx, params, vtable, generation,
+                                        params, vtable, generation,
                                     };
                                     match release_result {
                                         Ok(Resource::Available(state_avail)) => {
                                             debug!("{} got more resources, proceeding to main loop", core.params.name.as_ref());
-                                            Either::A(result(Ok(Loop::Break(BreakWait::ProceedMain { core, state_avail, }))))
+                                            Either::A(result(Ok(Loop::Break(BreakWait::ProceedMain { release_rx, core, state_avail, }))))
                                         },
                                         Ok(Resource::OutOfStock(state_no_left)) => {
                                             debug!("{} got no more resources, aquires left: {}", core.params.name.as_ref(), core.aquires_count);
                                             if core.aquires_count > 0 {
-                                                Either::A(result(Ok(Loop::Continue(WaitState { core, state_no_left, }))))
+                                                Either::A(result(Ok(Loop::Continue(WaitState { release_rx, core, state_no_left, }))))
                                             } else {
                                                 info!("{} runs out of resources, performing restart", core.params.name.as_ref());
                                                 let future = (core.vtable.close_wait_fn)(state_no_left)
                                                     .into_future()
                                                     .map(move |init_state| {
-                                                        Loop::Break(BreakWait::RequireRestart { core, init_state, })
+                                                        Loop::Break(BreakWait::RequireRestart { release_rx, core, init_state, })
                                                     });
                                                 Either::B(future)
                                             }
                                         },
                                         Err(ErrorSeverity::Recoverable { state: init_state, }) =>
-                                            Either::A(result(Ok(Loop::Break(BreakWait::RequireRestart { core, init_state, })))),
+                                            Either::A(result(Ok(Loop::Break(BreakWait::RequireRestart { release_rx, core, init_state, })))),
                                         Err(ErrorSeverity::Fatal(())) => {
                                             error!("{} crashed with fatal error, terminating", core.params.name.as_ref());
                                             Either::A(result(Err(())))
@@ -708,11 +747,11 @@ where FNA: FnMut(P) -> FA,
                                 .map(move |init_state| {
                                     Loop::Break(BreakWait::RequireRestart {
                                         core: Core {
-                                            release_rx: release_rx_stream.into_future(),
                                             aquires_count: if aquires_count > 0 { aquires_count - 1 } else { 0 },
-                                            aquire_rx, params, vtable, generation,
+                                            params, vtable, generation,
                                         },
                                         init_state,
+                                        release_rx,
                                     })
                                 });
                             Either::B(future)
@@ -720,18 +759,15 @@ where FNA: FnMut(P) -> FA,
                         Either::A(future)
                     } else {
                         debug!("wait_loop: skipping obsolete release request");
-                        let core = Core {
-                            release_rx: release_rx_stream.into_future(),
-                            aquire_rx, params, vtable, aquires_count, generation,
-                        };
-                        Either::B(result(Ok(Loop::Continue(WaitState { core, state_no_left, }))))
+                        let core = Core { params, vtable, aquires_count, generation, };
+                        Either::B(result(Ok(Loop::Continue(WaitState { release_rx, core, state_no_left, }))))
                     }
                 },
-                Ok((None, _release_rx_stream)) => {
+                Ok((None, _release_rx)) => {
                     debug!("wait_loop: release channel depleted");
                     Either::B(result(Ok(Loop::Break(BreakWait::Shutdown))))
                 },
-                Err(((), _release_rx_stream)) => {
+                Err(((), _release_rx)) => {
                     debug!("wait_loop: release channel outer endpoint dropped");
                     Either::B(result(Ok(Loop::Break(BreakWait::Shutdown))))
                 },
