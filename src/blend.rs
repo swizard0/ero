@@ -3,488 +3,339 @@ use futures::{
     Async,
 };
 
-pub struct Blender(());
+use std::marker::PhantomData;
 
-impl Blender {
-    pub fn new() -> Blender {
-        Blender(())
-    }
+#[derive(Debug)]
+struct Nil;
 
-    pub fn add_stream<S, MO, ME>(self, stream: S, map_ok: MO, map_err: ME) -> stream::Nil<S, MO, ME> {
-        stream::make_nil(stream, map_ok, map_err)
-    }
+#[derive(Debug)]
+struct Cons<A, D> {
+    car: A,
+    cdr: D,
+}
 
-    pub fn add_gen_future<G, N, MO, ME>(self, gen: G, next: N, map_ok: MO, map_err: ME) -> gen::Nil<G, N, MO, ME> {
-        gen::make_nil(gen, next, map_ok, map_err)
+struct Node<S, O> {
+    source: S,
+    _parts: PhantomData<O>,
+}
+
+struct Blender<B> {
+    chain: B,
+}
+
+impl Blender<Nil> {
+    fn add<S>(self, source: S) -> Blender<Cons<Node<S, (S, ())>, Nil>> where S: Source {
+        Blender {
+            chain: Cons {
+                car: Node {
+                    source,
+                    _parts: PhantomData,
+                },
+                cdr: self.chain,
+            },
+        }
     }
 }
 
-pub trait Decompose {
+impl<R, Q, P> Blender<Cons<Node<Q, P>, R>> {
+    fn add<S>(self, source: S) -> Blender<Cons<Node<S, (S, P)>, Cons<Node<Q, P>, R>>> where S: Source {
+        Blender {
+            chain: Cons {
+                car: Node {
+                    source,
+                    _parts: PhantomData,
+                },
+                cdr: self.chain,
+            },
+        }
+    }
+
+    fn finish_sources(self) -> FolderStart<Cons<Node<Q, P>, R>> {
+        FolderStart {
+            unfolded: self.chain,
+        }
+    }
+}
+
+struct FolderStart<N> {
+    unfolded: N,
+}
+
+impl<S, P, R> FolderStart<Cons<Node<S, (S, P)>, R>> {
+    fn fold<FO, FE, T, E, U, V>(self, fold_ok: FO, fold_err: FE) -> Folder<R, Cons<FNode<S, FO, FE, (), P>, Nil>, U, V>
+    where FO: Fn(T) -> U,
+          FE: Fn(E) -> V,
+    {
+        Folder {
+            unfolded: self.unfolded.cdr,
+            folded: Cons {
+                car: FNode {
+                    source: self.unfolded.car.source,
+                    fold_ok,
+                    fold_err,
+                    _zipper: PhantomData,
+                },
+                cdr: Nil,
+            },
+            _marker: PhantomData,
+        }
+    }
+}
+
+struct Folder<N, F, U, V> {
+    unfolded: N,
+    folded: F,
+    _marker: PhantomData<(U, V)>,
+}
+
+struct FNode<S, FO, FE, L, R> {
+    source: S,
+    fold_ok: FO,
+    fold_err: FE,
+    _zipper: PhantomData<(L, R)>,
+}
+
+impl<S, P, R, F, Q, GO, GE, L, RA, RD, U, V> Folder<Cons<Node<S, (S, P)>, R>, Cons<FNode<Q, GO, GE, L, (RA, RD)>, F>, U, V> {
+    fn fold<FO, FE, T, E>(
+        self,
+        fold_ok: FO,
+        fold_err: FE,
+    )
+        -> Folder<R, Cons<FNode<S, FO, FE, (Q, L), RD>, Cons<FNode<Q, GO, GE, L, (RA, RD)>, F>>, U, V>
+    where FO: Fn(T) -> U,
+          FE: Fn(E) -> V,
+    {
+        Folder {
+            unfolded: self.unfolded.cdr,
+            folded: Cons {
+                car: FNode {
+                    source: self.unfolded.car.source,
+                    fold_ok,
+                    fold_err,
+                    _zipper: PhantomData,
+                },
+                cdr: self.folded,
+            },
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<B, U, V> Folder<Nil, B, U, V> {
+    fn finish(self) -> Ready<B, U, V> {
+        Ready {
+            blender: Some(self.folded),
+            _marker: PhantomData,
+        }
+    }
+}
+
+struct Ready<B, U, V> {
+    blender: Option<B>,
+    _marker: PhantomData<(U, V)>,
+}
+
+trait Decompose {
     type Parts;
 
     fn decompose(self) -> Self::Parts;
 }
 
-pub trait TryFuture {
+impl Decompose for Nil {
+    type Parts = ();
+
+    fn decompose(self) -> Self::Parts {
+        ()
+    }
+}
+
+impl<S, FO, FE, L, R, P> Decompose for Cons<FNode<S, FO, FE, L, R>, P> where P: Decompose {
+    type Parts = (S, P::Parts);
+
+    fn decompose(self) -> Self::Parts {
+        (self.car.source, self.cdr.decompose())
+    }
+}
+
+enum SourcePoll<T, N, D, E> {
+    NotReady(N),
+    Ready { item: T, next: N, },
+    Depleted(D),
+    Error(E),
+}
+
+trait Source: Sized {
     type Item;
+    type Depleted;
     type Error;
 
-    fn try_poll(&mut self) -> Option<Poll<Self::Item, Self::Error>>;
+    fn source_poll(self) -> SourcePoll<Self::Item, Self, Self::Depleted, Self::Error>;
 }
 
-fn try_poll_to_poll<U, V, F>(
-    future: &mut F
-)
-    -> Poll<Option<(U, F)>, (V, F)>
-where F: TryFuture<Item = (U, F), Error = (V, F)>
+struct Gone;
+
+impl<S> Source for S where S: Stream {
+    type Item = S::Item;
+    type Depleted = Gone;
+    type Error = S::Error;
+
+    fn source_poll(mut self) -> SourcePoll<Self::Item, Self, Self::Depleted, Self::Error> {
+        match self.poll() {
+            Ok(Async::NotReady) =>
+                SourcePoll::NotReady(self),
+            Ok(Async::Ready(Some(item))) =>
+                SourcePoll::Ready { item, next: self, },
+            Ok(Async::Ready(None)) =>
+                SourcePoll::Depleted(Gone),
+            Err(error) =>
+                SourcePoll::Error(error),
+        }
+    }
+}
+
+struct FutureGenerator<F, N> {
+    future: F,
+    next: N,
+}
+
+impl<F, N, T, K> Source for FutureGenerator<F, N> where F: Future<Item = (Option<T>, K)>, N: Fn(K) -> F {
+    type Item = T;
+    type Depleted = K;
+    type Error = F::Error;
+
+    fn source_poll(mut self) -> SourcePoll<Self::Item, Self, Self::Depleted, Self::Error> {
+        match self.future.poll() {
+            Ok(Async::NotReady) =>
+                SourcePoll::NotReady(self),
+            Ok(Async::Ready((Some(item), kont))) => {
+                let next_future = (self.next)(kont);
+                SourcePoll::Ready { item, next: FutureGenerator { future: next_future, next: self.next, }, }
+            },
+            Ok(Async::Ready((None, kont))) =>
+                SourcePoll::Depleted(kont),
+            Err(error) =>
+                SourcePoll::Error(error),
+        }
+    }
+}
+
+enum OwnedPoll<U, V, S, R> {
+    NotReady { me: S, tail: R, },
+    Ready { folded_ok: U, me: S, tail: R, },
+    Depleted { folded_err: V, },
+    Error { folded_err: V, },
+}
+
+#[derive(Debug)]
+struct DecomposeZip<DL, D, DR> {
+    left_dir: DL,
+    myself: D,
+    right_rev: DR,
+}
+
+enum ErrorEvent<DL, D, DR, E> {
+    Depleted { decomposed: DecomposeZip<DL, D, DR>, },
+    Error { error: E, decomposed: DecomposeZip<DL, Gone, DR>, },
+}
+
+trait Probe<U, V, A>: Sized {
+    fn probe(self, tail: A) -> OwnedPoll<U, V, Self, A>;
+}
+
+impl<U, V, A> Probe<U, V, A> for Nil {
+    fn probe(self, tail: A) -> OwnedPoll<U, V, Self, A> {
+        OwnedPoll::NotReady { me: self, tail, }
+    }
+}
+
+impl<U, V, S, FO, FE, L, R, P> Probe<U, V, R> for Cons<FNode<S, FO, FE, L, R>, P>
+where P: Probe<U, V, (S, R)> + Decompose<Parts = L>,
+      S: Source,
+      FO: Fn(S::Item) -> U,
+      FE: Fn(ErrorEvent<L, S::Depleted, R, S::Error>) -> V,
 {
-    match future.try_poll() {
-        Some(Ok(Async::Ready(item))) =>
-            Ok(Async::Ready(Some(item))),
-        Some(Ok(Async::NotReady)) =>
-            Ok(Async::NotReady),
-        Some(Err(error)) =>
-            Err(error),
-        None =>
-            Ok(Async::Ready(None)),
-    }
-}
-
-mod stream {
-    use std::mem;
-    use futures::{
-        Poll,
-        Async,
-        Future,
-        Stream,
-    };
-
-    enum Inner<S, MO, ME> {
-        Taken,
-        Active {
-            stream: S,
-            map_ok: MO,
-            map_err: ME,
-        },
-        Disabled {
-            stream: S,
-        },
-    }
-
-    pub struct Nil<S, MO, ME> {
-        inner: Inner<S, MO, ME>,
-    }
-
-    pub fn make_nil<S, MO, ME>(stream: S, map_ok: MO, map_err: ME) -> Nil<S, MO, ME> {
-        Nil { inner: Inner::Active { stream, map_ok, map_err, }, }
-    }
-
-    impl<SS, MOS, MES> Nil<SS, MOS, MES> {
-        pub fn add_stream<S, MO, ME>(self, stream: S, map_ok: MO, map_err: ME) -> Cons<Nil<SS, MOS, MES>, S, MO, ME> {
-            make_cons(stream, map_ok, map_err, self)
-        }
-
-        pub fn add_gen_future<G, N, MO, ME>(self, gen: G, next: N, map_ok: MO, map_err: ME) -> super::gen::Cons<Nil<SS, MOS, MES>, G, N, MO, ME> {
-            super::gen::make_cons(gen, next, map_ok, map_err, self)
-        }
-    }
-
-    pub struct Cons<P, S, MO, ME> {
-        inner: Inner<S, MO, ME>,
-        cdr: Option<P>,
-    }
-
-    pub fn make_cons<P, S, MO, ME>(stream: S, map_ok: MO, map_err: ME, cdr: P) -> Cons<P, S, MO, ME> {
-        Cons {
-            inner: Inner::Active { stream, map_ok, map_err },
-            cdr: Some(cdr),
-        }
-    }
-
-    impl<P, SS, MOS, MES> Cons<P, SS, MOS, MES> {
-        pub fn add_stream<S, MO, ME>(self, stream: S, map_ok: MO, map_err: ME) -> Cons<Cons<P, SS, MOS, MES>, S, MO, ME> {
-            make_cons(stream, map_ok, map_err, self)
-        }
-
-        pub fn add_gen_future<G, N, MO, ME>(self, gen: G, next: N, map_ok: MO, map_err: ME) -> super::gen::Cons<Cons<P, SS, MOS, MES>, G, N, MO, ME> {
-            super::gen::make_cons(gen, next, map_ok, map_err, self)
-        }
-    }
-
-    impl<S, MO, ME> super::Decompose for Nil<S, MO, ME> {
-        type Parts = S;
-
-        fn decompose(self) -> Self::Parts {
-            self.inner.into_stream()
-        }
-    }
-
-    impl<P, S, MO, ME> super::Decompose for Cons<P, S, MO, ME> where P: super::Decompose {
-        type Parts = (S, P::Parts);
-
-        fn decompose(self) -> Self::Parts {
-            (
-                self.inner.into_stream(),
-                self.cdr.expect("decomposing already triggered blend::stream::Cons").decompose()
-            )
-        }
-    }
-
-    impl<S, MO, ME> Inner<S, MO, ME> {
-        fn into_stream(self) -> S {
-            match self {
-                Inner::Active { stream, .. } | Inner::Disabled { stream, } =>
-                    stream,
-                Inner::Taken =>
-                    panic!("decomposing already triggered blend::stream::Inner"),
-            }
-        }
-    }
-
-    impl<U, V, S, MO, ME> Inner<S, MO, ME> where S: Stream, MO: Fn(Option<S::Item>) -> U, ME: Fn(S::Error) -> V {
-        fn try_poll_inner(&mut self) -> Option<Poll<(U, Self), (V, Self)>> {
-            match mem::replace(self, Inner::Taken) {
-                Inner::Active { mut stream, map_ok, map_err, } =>
-                    Some(match stream.poll() {
-                        Ok(Async::NotReady) => {
-                            *self = Inner::Active { stream, map_ok, map_err, };
-                            Ok(Async::NotReady)
+    fn probe(self, tail: R) -> OwnedPoll<U, V, Self, R> {
+        let Cons { car: FNode { source, fold_ok, fold_err, .. }, cdr, } = self;
+        match cdr.probe((source, tail)) {
+            OwnedPoll::NotReady { me: cdr, tail: (source, tail), } => {
+                match source.source_poll() {
+                    SourcePoll::NotReady(source) =>
+                        OwnedPoll::NotReady {
+                            me: Cons {
+                                car: FNode { source, fold_ok, fold_err, _zipper: PhantomData, },
+                                cdr,
+                            },
+                            tail,
                         },
-                        Ok(Async::Ready(Some(item))) => {
-                            let item = map_ok(Some(item));
-                            Ok(Async::Ready((item, Inner::Active { stream, map_ok, map_err, })))
-                        },
-                        Ok(Async::Ready(None)) => {
-                            let item = map_ok(None);
-                            Ok(Async::Ready((item, Inner::Disabled { stream, })))
-                        },
-                        Err(error) => {
-                            let error = map_err(error);
-                            Err((error, Inner::Disabled { stream, }))
-                        },
-                    }),
-                Inner::Taken =>
-                    panic!("cannot poll blend::stream::Inner twice"),
-                inner @ Inner::Disabled { .. } => {
-                    *self = inner;
-                    None
-                },
-            }
-        }
-    }
-
-    impl<U, V, S, MO, ME> super::TryFuture for Nil<S, MO, ME>
-    where S: Stream,
-          MO: Fn(Option<S::Item>) -> U,
-          ME: Fn(S::Error) -> V,
-    {
-        type Item = (U, Self);
-        type Error = (V, Self);
-
-        fn try_poll(&mut self) -> Option<Poll<Self::Item, Self::Error>> {
-            Some(match self.inner.try_poll_inner()? {
-                Ok(Async::NotReady) =>
-                    Ok(Async::NotReady),
-                Ok(Async::Ready((item, inner))) =>
-                    Ok(Async::Ready((item, Nil { inner, }))),
-                Err((error, inner)) =>
-                    Err((error, Nil { inner, })),
-            })
-        }
-    }
-
-    impl<U, V, S, MO, ME> Future for Nil<S, MO, ME>
-    where S: Stream,
-          MO: Fn(Option<S::Item>) -> U,
-          ME: Fn(S::Error) -> V,
-    {
-        type Item = Option<(U, Self)>;
-        type Error = (V, Self);
-
-        fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-            super::try_poll_to_poll(self)
-        }
-    }
-
-    impl<U, V, P, S, MO, ME> super::TryFuture for Cons<P, S, MO, ME>
-    where P: super::TryFuture<Item = (U, P), Error = (V, P)>,
-          S: Stream,
-          MO: Fn(Option<S::Item>) -> U,
-          ME: Fn(S::Error) -> V,
-    {
-        type Item = (U, Self);
-        type Error = (V, Self);
-
-        fn try_poll(&mut self) -> Option<Poll<Self::Item, Self::Error>> {
-            let mut cdr = self.cdr.take()?;
-            match cdr.try_poll() {
-                None | Some(Ok(Async::NotReady)) => {
-                    Some(match self.inner.try_poll_inner()? {
-                        Ok(Async::NotReady) => {
-                            self.cdr = Some(cdr);
-                            Ok(Async::NotReady)
-                        },
-                        Ok(Async::Ready((item, inner))) =>
-                            Ok(Async::Ready((item, Cons { inner, cdr: Some(cdr), }))),
-                        Err((error, inner)) =>
-                            Err((error, Cons { inner, cdr: Some(cdr), })),
-                    })
-                },
-                Some(Ok(Async::Ready((item, cdr)))) => {
-                    let blender = Cons {
-                        inner: mem::replace(&mut self.inner, Inner::Taken),
-                        cdr: Some(cdr),
-                    };
-                    Some(Ok(Async::Ready((item, blender))))
-                },
-                Some(Err((error, cdr))) => {
-                    let blender = Cons {
-                        inner: mem::replace(&mut self.inner, Inner::Taken),
-                        cdr: Some(cdr),
-                    };
-                    Some(Err((error, blender)))
-                },
-            }
-        }
-    }
-
-    impl<U, V, P, S, MO, ME> Future for Cons<P, S, MO, ME>
-    where P: super::TryFuture<Item = (U, P), Error = (V, P)>,
-          S: Stream,
-          MO: Fn(Option<S::Item>) -> U,
-          ME: Fn(S::Error) -> V,
-    {
-        type Item = Option<(U, Self)>;
-        type Error = (V, Self);
-
-        fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-            super::try_poll_to_poll(self)
+                    SourcePoll::Ready { item, next: source, } => {
+                        let folded_ok = fold_ok(item);
+                        OwnedPoll::Ready {
+                            folded_ok,
+                            me: Cons { car: FNode { source, fold_ok, fold_err, _zipper: PhantomData, }, cdr, },
+                            tail,
+                        }
+                    },
+                    SourcePoll::Depleted(depleted_token) => {
+                        let decomposed_left = cdr.decompose();
+                        let decomposed_right = tail;
+                        let folded_err = fold_err(ErrorEvent::Depleted {
+                            decomposed: DecomposeZip {
+                                left_dir: decomposed_left,
+                                myself: depleted_token,
+                                right_rev: decomposed_right,
+                            },
+                        });
+                        OwnedPoll::Depleted { folded_err, }
+                    },
+                    SourcePoll::Error(error) => {
+                        let decomposed_left = cdr.decompose();
+                        let decomposed_right = tail;
+                        let folded_err = fold_err(ErrorEvent::Error {
+                            decomposed: DecomposeZip {
+                                left_dir: decomposed_left,
+                                myself: Gone,
+                                right_rev: decomposed_right,
+                            },
+                            error,
+                        });
+                        OwnedPoll::Error { folded_err, }
+                    },
+                }
+            },
+            OwnedPoll::Ready { folded_ok, me: cdr, tail: (source, tail), } =>
+                OwnedPoll::Ready { folded_ok, me: Cons { car: FNode { source, fold_ok, fold_err, _zipper: PhantomData, }, cdr, }, tail, },
+            OwnedPoll::Depleted { folded_err, } =>
+                OwnedPoll::Depleted { folded_err, },
+            OwnedPoll::Error { folded_err, } =>
+                OwnedPoll::Error { folded_err, },
         }
     }
 }
 
-mod gen {
-    use std::mem;
-    use futures::{
-        Poll,
-        Async,
-        Future,
-    };
+impl<U, V, B> Future for Ready<B, U, V> where B: Probe<U, V, ()> {
+    type Item = (U, Self);
+    type Error = V;
 
-    enum Inner<G, N, MO, ME> {
-        Taken,
-        Active {
-            gen: G,
-            next: N,
-            map_ok: MO,
-            map_err: ME,
-        },
-        Disabled {
-            gen: G,
-            next: N,
-        },
-    }
-
-    pub struct Nil<G, N, MO, ME> {
-        inner: Inner<G, N, MO, ME>,
-    }
-
-    pub fn make_nil<G, N, MO, ME>(gen: G, next: N, map_ok: MO, map_err: ME) -> Nil<G, N, MO, ME> {
-        Nil { inner: Inner::Active { gen, next, map_ok, map_err, }, }
-    }
-
-    impl<GG, NG, MOG, MEG> Nil<GG, NG, MOG, MEG> {
-        pub fn add_stream<S, MO, ME>(self, stream: S, map_ok: MO, map_err: ME) -> super::stream::Cons<Nil<GG, NG, MOG, MEG>, S, MO, ME> {
-            super::stream::make_cons(stream, map_ok, map_err, self)
-        }
-
-        pub fn add_gen_future<G, N, MO, ME>(self, gen: G, next: N, map_ok: MO, map_err: ME) -> Cons<Nil<GG, NG, MOG, MEG>, G, N, MO, ME> {
-            make_cons(gen, next, map_ok, map_err, self)
-        }
-    }
-
-    pub struct Cons<P, G, N, MO, ME> {
-        inner: Inner<G, N, MO, ME>,
-        cdr: Option<P>,
-    }
-
-    pub fn make_cons<P, G, N, MO, ME>(gen: G, next: N, map_ok: MO, map_err: ME, cdr: P) -> Cons<P, G, N, MO, ME> {
-        Cons {
-            inner: Inner::Active { gen, next, map_ok, map_err, },
-            cdr: Some(cdr),
-        }
-    }
-
-    impl<P, GG, NG, MOG, MEG> Cons<P, GG, NG, MOG, MEG> {
-        pub fn add_stream<S, MO, ME>(self, stream: S, map_ok: MO, map_err: ME) -> super::stream::Cons<Cons<P, GG, NG, MOG, MEG>, S, MO, ME> {
-            super::stream::make_cons(stream, map_ok, map_err, self)
-        }
-
-        pub fn add_gen_future<G, N, MO, ME>(self, gen: G, next: N, map_ok: MO, map_err: ME) -> Cons<Cons<P, GG, NG, MOG, MEG>, G, N, MO, ME> {
-            make_cons(gen, next, map_ok, map_err, self)
-        }
-    }
-
-    impl<G, N, MO, ME> super::Decompose for Nil<G, N, MO, ME> {
-        type Parts = (G, N);
-
-        fn decompose(self) -> Self::Parts {
-            self.inner.into_gen_future()
-        }
-    }
-
-    impl<P, G, N, MO, ME> super::Decompose for Cons<P, G, N, MO, ME> where P: super::Decompose {
-        type Parts = ((G, N), P::Parts);
-
-        fn decompose(self) -> Self::Parts {
-            (
-                self.inner.into_gen_future(),
-                self.cdr.expect("decomposing already triggered blend::gen::Cons").decompose()
-            )
-        }
-    }
-
-    impl<G, N, MO, ME> Inner<G, N, MO, ME> {
-        fn into_gen_future(self) -> (G, N) {
-            match self {
-                Inner::Active { gen, next, .. } | Inner::Disabled { gen, next, } =>
-                    (gen, next),
-                Inner::Taken =>
-                    panic!("decomposing already triggered blend::gen::Inner"),
-            }
-        }
-    }
-
-    impl<U, V, W, T, E, G, N, MO, ME> Inner<G, N, MO, ME>
-    where G: Future<Item = (Option<T>, W), Error = (E, W)>,
-          N: Fn(W) -> G,
-          MO: Fn(Option<T>) -> U,
-          ME: Fn(E) -> V,
-    {
-        fn try_poll_inner(&mut self) -> Option<Poll<(U, Self), (V, Self)>> {
-            match mem::replace(self, Inner::Taken) {
-                Inner::Active { mut gen, next, map_ok, map_err, } =>
-                    Some(match gen.poll() {
-                        Ok(Async::NotReady) => {
-                            *self = Inner::Active { gen, next, map_ok, map_err, };
-                            Ok(Async::NotReady)
-                        },
-                        Ok(Async::Ready((Some(item), kont))) => {
-                            let item = map_ok(Some(item));
-                            mem::replace(&mut gen, next(kont));
-                            Ok(Async::Ready((item, Inner::Active { gen, next, map_ok, map_err, })))
-                        },
-                        Ok(Async::Ready((None, kont))) => {
-                            let item = map_ok(None);
-                            mem::replace(&mut gen, next(kont));
-                            Ok(Async::Ready((item, Inner::Disabled { gen, next, })))
-                        },
-                        Err((error, kont)) => {
-                            let error = map_err(error);
-                            mem::replace(&mut gen, next(kont));
-                            Err((error, Inner::Disabled { gen, next, }))
-                        },
-                    }),
-                Inner::Taken =>
-                    panic!("cannot poll blend::gen::Inner twice"),
-                inner @ Inner::Disabled { .. } => {
-                    *self = inner;
-                    None
-                },
-            }
-        }
-    }
-
-    impl<U, V, W, T, E, G, N, MO, ME> super::TryFuture for Nil<G, N, MO, ME>
-    where G: Future<Item = (Option<T>, W), Error = (E, W)>,
-          N: Fn(W) -> G,
-          MO: Fn(Option<T>) -> U,
-          ME: Fn(E) -> V,
-    {
-        type Item = (U, Self);
-        type Error = (V, Self);
-
-        fn try_poll(&mut self) -> Option<Poll<Self::Item, Self::Error>> {
-            Some(match self.inner.try_poll_inner()? {
-                Ok(Async::NotReady) =>
-                    Ok(Async::NotReady),
-                Ok(Async::Ready((item, inner))) =>
-                    Ok(Async::Ready((item, Nil { inner, }))),
-                Err((error, inner)) =>
-                    Err((error, Nil { inner, })),
-            })
-        }
-    }
-
-    impl<U, V, W, T, E, G, N, MO, ME> Future for Nil<G, N, MO, ME>
-    where G: Future<Item = (Option<T>, W), Error = (E, W)>,
-          N: Fn(W) -> G,
-          MO: Fn(Option<T>) -> U,
-          ME: Fn(E) -> V,
-    {
-        type Item = Option<(U, Self)>;
-        type Error = (V, Self);
-
-        fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-            super::try_poll_to_poll(self)
-        }
-    }
-
-    impl<U, V, W, P, T, E, G, N, MO, ME> super::TryFuture for Cons<P, G, N, MO, ME>
-    where P: super::TryFuture<Item = (U, P), Error = (V, P)>,
-          G: Future<Item = (Option<T>, W), Error = (E, W)>,
-          N: Fn(W) -> G,
-          MO: Fn(Option<T>) -> U,
-          ME: Fn(E) -> V,
-    {
-        type Item = (U, Self);
-        type Error = (V, Self);
-
-        fn try_poll(&mut self) -> Option<Poll<Self::Item, Self::Error>> {
-            let mut cdr = self.cdr.take()?;
-            match cdr.try_poll() {
-                None | Some(Ok(Async::NotReady)) => {
-                    Some(match self.inner.try_poll_inner()? {
-                        Ok(Async::NotReady) => {
-                            self.cdr = Some(cdr);
-                            Ok(Async::NotReady)
-                        },
-                        Ok(Async::Ready((item, inner))) =>
-                            Ok(Async::Ready((item, Cons { inner, cdr: Some(cdr), }))),
-                        Err((error, inner)) =>
-                            Err((error, Cons { inner, cdr: Some(cdr), })),
-                    })
-                },
-                Some(Ok(Async::Ready((item, cdr)))) => {
-                    let blender = Cons {
-                        inner: mem::replace(&mut self.inner, Inner::Taken),
-                        cdr: Some(cdr),
-                    };
-                    Some(Ok(Async::Ready((item, blender))))
-                },
-                Some(Err((error, cdr))) => {
-                    let blender = Cons {
-                        inner: mem::replace(&mut self.inner, Inner::Taken),
-                        cdr: Some(cdr),
-                    };
-                    Some(Err((error, blender)))
-                },
-            }
-        }
-    }
-
-    impl<U, V, W, P, T, E, G, N, MO, ME> Future for Cons<P, G, N, MO, ME>
-    where P: super::TryFuture<Item = (U, P), Error = (V, P)>,
-          G: Future<Item = (Option<T>, W), Error = (E, W)>,
-          N: Fn(W) -> G,
-          MO: Fn(Option<T>) -> U,
-          ME: Fn(E) -> V,
-    {
-        type Item = Option<(U, Self)>;
-        type Error = (V, Self);
-
-        fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-            super::try_poll_to_poll(self)
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        let blender = self.blender.take().expect("cannot poll Ready twice");
+        match blender.probe(()) {
+            OwnedPoll::NotReady { me, tail: (), } => {
+                self.blender = Some(me);
+                Ok(Async::NotReady)
+            },
+            OwnedPoll::Ready { folded_ok, me, tail: (), } => {
+                Ok(Async::Ready((
+                    folded_ok,
+                    Ready {
+                        blender: Some(me),
+                        _marker: PhantomData,
+                    },
+                )))
+            },
+            OwnedPoll::Depleted { folded_err, } =>
+                Err(folded_err),
+            OwnedPoll::Error { folded_err, } =>
+                Err(folded_err),
         }
     }
 }
