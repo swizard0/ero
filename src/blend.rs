@@ -211,9 +211,9 @@ impl<S> Source for S where S: Stream {
     }
 }
 
-struct FutureGenerator<F, N> {
-    future: F,
-    next: N,
+pub struct FutureGenerator<F, N> {
+    pub future: F,
+    pub next: N,
 }
 
 impl<F, N, T, K> Source for FutureGenerator<F, N> where F: Future<Item = (Option<T>, K)>, N: Fn(K) -> F {
@@ -330,6 +330,30 @@ where P: Probe<U, V, (S, R)> + Decompose<Parts = L>,
     }
 }
 
+impl<U, V, B> Source for BlenderReady<B, U, V> where B: Probe<U, V, ()> {
+    type Item = U;
+    type Depleted = V;
+    type Error = V;
+
+    fn source_poll(mut self) -> SourcePoll<Self::Item, Self, Self::Depleted, Self::Error> {
+        let blender = self.blender.take().expect("cannot source_poll BlenderReady after regular poll");
+        match blender.probe(()) {
+            OwnedPoll::NotReady { me, tail: (), } => {
+                self.blender = Some(me);
+                SourcePoll::NotReady(self)
+            },
+            OwnedPoll::Ready { folded_ok, me, tail: (), } => {
+                self.blender = Some(me);
+                SourcePoll::Ready { item: folded_ok, next: self, }
+            },
+            OwnedPoll::Depleted { folded_err, } =>
+                SourcePoll::Depleted(folded_err),
+            OwnedPoll::Error { folded_err, } =>
+                SourcePoll::Error(folded_err),
+        }
+    }
+}
+
 impl<U, V, B> Future for BlenderReady<B, U, V> where B: Probe<U, V, ()> {
     type Item = (U, Self);
     type Error = V;
@@ -366,6 +390,7 @@ mod tests {
     };
     use futures::{
         Future,
+        Stream,
         future::Either,
         stream::{
             self,
@@ -378,6 +403,7 @@ mod tests {
         Blender,
         ErrorEvent,
         DecomposeZip,
+        FutureGenerator,
     };
 
     #[test]
@@ -450,79 +476,75 @@ mod tests {
         }
     }
 
+    #[test]
     fn blend_3_mix() {
         let stream_a = stream::iter_ok::<_, ()>(vec![0u8, 1, 2]);
         let stream_b = stream::iter_ok::<_, ()>(vec![true, false]);
         let stream_c = stream::iter_ok::<_, ()>(vec!["5"]);
+        let stream_e = stream::iter_ok::<_, ()>(vec!['a', 'b']);
 
-        // let blender_a = Blender::new()
-        //     .add(stream_a)
-        //     .finish_sources()
-        //     .fold_id()
-        //     .finish();
+        let sub_blender = Blender::new()
+            .add(stream_a)
+            .add(stream_b)
+            .finish_sources()
+            .fold(Either::B, Either::B)
+            .fold(Either::A, Either::A)
+            .finish();
 
-        // #[derive(PartialEq, Debug)]
-        // enum Var3<A, B, C> { A(A), B(B), C(C), }
+        enum Var3<A, B, C> { A(A), B(B), C(C), }
 
-        // let blender = Blender::new()
-        //     .add(stream_a)
-        //     .add(stream_b)
-        //     .add(stream_c)
-        //     .finish_sources()
-        //     .fold(Var3::C, Var3::C)
-        //     .fold(Var3::B, Var3::B)
-        //     .fold(Var3::A, Var3::A)
-        //     .finish();
-        // let blender = match blender.wait() {
-        //     Ok((Var3::C("5"), blender)) => blender,
-        //     _other => panic!("unexpected wait result"),
-        // };
-        // let (stream_a, stream_b) = match blender.wait() {
-        //     Err(Var3::C(ErrorEvent::Depleted { decomposed: DecomposeZip { left_dir: (), myself: Gone, right_rev: (stream_b, (stream_a, ())), }, })) =>
-        //         (stream_a, stream_b),
-        //     _other => panic!("unexpected wait result"),
-        // };
-        // let blender = Blender::new()
-        //     .add(stream_a)
-        //     .add(stream_b)
-        //     .finish_sources()
-        //     .fold(Either::B, Either::B)
-        //     .fold(Either::A, Either::A)
-        //     .finish();
-        // let blender = match blender.wait() {
-        //     Ok((Either::B(true), blender)) => blender,
-        //     _other => panic!("unexpected wait result"),
-        // };
-        // let blender = match blender.wait() {
-        //     Ok((Either::B(false), blender)) => blender,
-        //     _other => panic!("unexpected wait result"),
-        // };
-        // let stream_a = match blender.wait() {
-        //     Err(Either::B(ErrorEvent::Depleted { decomposed: DecomposeZip { left_dir: (), myself: Gone, right_rev: (stream_a, ()), }, })) =>
-        //         stream_a,
-        //     _other => panic!("unexpected wait result"),
-        // };
-        // let blender = Blender::new()
-        //     .add(stream_a)
-        //     .finish_sources()
-        //     .fold(|x| x, |x| x)
-        //     .finish();
-        // let blender = match blender.wait() {
-        //     Ok((0, blender)) => blender,
-        //     _other => panic!("unexpected wait result"),
-        // };
-        // let blender = match blender.wait() {
-        //     Ok((1, blender)) => blender,
-        //     _other => panic!("unexpected wait result"),
-        // };
-        // let blender = match blender.wait() {
-        //     Ok((2, blender)) => blender,
-        //     _other => panic!("unexpected wait result"),
-        // };
-        // match blender.wait() {
-        //     Err(ErrorEvent::Depleted { decomposed: DecomposeZip { left_dir: (), myself: Gone, right_rev: (), }, }) => (),
-        //     _other => panic!("unexpected wait result"),
-        // }
+        let blender = Blender::new()
+            .add(stream_c)
+            .add(FutureGenerator { future: stream_e.into_future(), next: Stream::into_future, })
+            .add(sub_blender)
+            .finish_sources()
+            .fold(Var3::C, Var3::C)
+            .fold(Var3::B, Var3::B)
+            .fold(Var3::A, Var3::A)
+            .finish();
+        let blender = match blender.wait() {
+            Ok((Var3::C(Either::B(true)), blender)) => blender,
+            _other => panic!("unexpected wait result"),
+        };
+        let blender = match blender.wait() {
+            Ok((Var3::C(Either::B(false)), blender)) => blender,
+            _other => panic!("unexpected wait result"),
+        };
+        let (stream_c, stream_gen, stream_a) = match blender.wait() {
+            Err(Var3::C(ErrorEvent::Depleted {
+                decomposed: DecomposeZip {
+                    left_dir: (),
+                    myself: Either::B(ErrorEvent::Depleted {
+                        decomposed: DecomposeZip {
+                            left_dir: (),
+                            myself: Gone,
+                            right_rev: (stream_a, ()),
+                        },
+                    }),
+                    right_rev: (stream_gen, (stream_c, ())),
+                },
+            })) =>
+                (stream_c, stream_gen, stream_a),
+            _other => panic!("unexpected wait result"),
+        };
+        let blender = Blender::new()
+            .add(stream_a)
+            .add(stream_c)
+            .add(stream_gen)
+            .finish_sources()
+            .fold(Var3::C, Var3::C)
+            .fold(Var3::B, Var3::B)
+            .fold(Var3::A, Var3::A)
+            .finish();
+        let blender = match blender.wait() {
+            Ok((Var3::C('a'), blender)) => blender,
+            _other => panic!("unexpected wait result"),
+        };
+        let _blender = match blender.wait() {
+            Ok((Var3::C('b'), blender)) => blender,
+            _other => panic!("unexpected wait result"),
+        };
+        // .. etc
     }
 
     #[test]
