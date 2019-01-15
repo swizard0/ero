@@ -28,7 +28,7 @@ use log::{
     error,
 };
 
-use erlust::{
+use ero::{
     Loop,
     ErrorSeverity,
     RestartStrategy,
