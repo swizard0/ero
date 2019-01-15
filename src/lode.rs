@@ -80,10 +80,18 @@ pub struct LodeShutdown {
 type AquirePeer<R> = mpsc::Receiver<AquireReq<R>>;
 type ReleasePeer<R> = mpsc::UnboundedReceiver<ReleaseReq<R>>;
 
-#[derive(Clone)]
 pub struct LodeResource<R> {
     aquire_tx: mpsc::Sender<AquireReq<R>>,
     release_tx: mpsc::UnboundedSender<ReleaseReq<R>>,
+}
+
+impl<R> Clone for LodeResource<R> {
+    fn clone(&self) -> Self {
+        LodeResource {
+            aquire_tx: self.aquire_tx.clone(),
+            release_tx: self.release_tx.clone(),
+        }
+    }
 }
 
 pub struct Lode<R> {
