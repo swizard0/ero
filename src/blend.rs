@@ -1,6 +1,8 @@
 use futures::{
     Poll,
     Async,
+    Stream,
+    Future,
 };
 
 use std::marker::PhantomData;
@@ -14,7 +16,7 @@ struct Cons<A, D> {
     cdr: D,
 }
 
-struct Node<S, O> {
+struct SourceNode<S, O> {
     source: S,
     _parts: PhantomData<O>,
 }
@@ -24,10 +26,16 @@ struct Blender<B> {
 }
 
 impl Blender<Nil> {
-    fn add<S>(self, source: S) -> Blender<Cons<Node<S, (S, ())>, Nil>> where S: Source {
+    fn new() -> Blender<Nil> {
+        Blender {
+            chain: Nil,
+        }
+    }
+
+    fn add<S>(self, source: S) -> Blender<Cons<SourceNode<S, (S, ())>, Nil>> where S: Source {
         Blender {
             chain: Cons {
-                car: Node {
+                car: SourceNode {
                     source,
                     _parts: PhantomData,
                 },
@@ -37,11 +45,11 @@ impl Blender<Nil> {
     }
 }
 
-impl<R, Q, P> Blender<Cons<Node<Q, P>, R>> {
-    fn add<S>(self, source: S) -> Blender<Cons<Node<S, (S, P)>, Cons<Node<Q, P>, R>>> where S: Source {
+impl<R, Q, P> Blender<Cons<SourceNode<Q, P>, R>> {
+    fn add<S>(self, source: S) -> Blender<Cons<SourceNode<S, (S, P)>, Cons<SourceNode<Q, P>, R>>> where S: Source {
         Blender {
             chain: Cons {
-                car: Node {
+                car: SourceNode {
                     source,
                     _parts: PhantomData,
                 },
@@ -50,26 +58,28 @@ impl<R, Q, P> Blender<Cons<Node<Q, P>, R>> {
         }
     }
 
-    fn finish_sources(self) -> FolderStart<Cons<Node<Q, P>, R>> {
-        FolderStart {
+    fn finish_sources(self) -> FolderInit<Cons<SourceNode<Q, P>, R>> {
+        FolderInit {
             unfolded: self.chain,
         }
     }
 }
 
-struct FolderStart<N> {
+struct FolderInit<N> {
     unfolded: N,
 }
 
-impl<S, P, R> FolderStart<Cons<Node<S, (S, P)>, R>> {
-    fn fold<FO, FE, T, E, U, V>(self, fold_ok: FO, fold_err: FE) -> Folder<R, Cons<FNode<S, FO, FE, (), P>, Nil>, U, V>
+fn id<T>(x: T) -> T { x }
+
+impl<S, P, R> FolderInit<Cons<SourceNode<S, (S, P)>, R>> {
+    fn fold<FO, FE, T, E, U, V>(self, fold_ok: FO, fold_err: FE) -> Folder<R, Cons<FoldNode<S, FO, FE, (), P>, Nil>, U, V>
     where FO: Fn(T) -> U,
           FE: Fn(E) -> V,
     {
         Folder {
             unfolded: self.unfolded.cdr,
             folded: Cons {
-                car: FNode {
+                car: FoldNode {
                     source: self.unfolded.car.source,
                     fold_ok,
                     fold_err,
@@ -80,6 +90,10 @@ impl<S, P, R> FolderStart<Cons<Node<S, (S, P)>, R>> {
             _marker: PhantomData,
         }
     }
+
+    fn fold_id<U, V>(self) -> Folder<R, Cons<FoldNode<S, fn(U) -> U, fn(V) -> V, (), P>, Nil>, U, V> {
+        self.fold(id, id)
+    }
 }
 
 struct Folder<N, F, U, V> {
@@ -88,27 +102,27 @@ struct Folder<N, F, U, V> {
     _marker: PhantomData<(U, V)>,
 }
 
-struct FNode<S, FO, FE, L, R> {
+struct FoldNode<S, FO, FE, L, R> {
     source: S,
     fold_ok: FO,
     fold_err: FE,
     _zipper: PhantomData<(L, R)>,
 }
 
-impl<S, P, R, F, Q, GO, GE, L, RA, RD, U, V> Folder<Cons<Node<S, (S, P)>, R>, Cons<FNode<Q, GO, GE, L, (RA, RD)>, F>, U, V> {
+impl<S, P, R, F, Q, GO, GE, L, RA, RD, U, V> Folder<Cons<SourceNode<S, (S, P)>, R>, Cons<FoldNode<Q, GO, GE, L, (RA, RD)>, F>, U, V> {
     fn fold<FO, FE, T, E>(
         self,
         fold_ok: FO,
         fold_err: FE,
     )
-        -> Folder<R, Cons<FNode<S, FO, FE, (Q, L), RD>, Cons<FNode<Q, GO, GE, L, (RA, RD)>, F>>, U, V>
+        -> Folder<R, Cons<FoldNode<S, FO, FE, (Q, L), RD>, Cons<FoldNode<Q, GO, GE, L, (RA, RD)>, F>>, U, V>
     where FO: Fn(T) -> U,
           FE: Fn(E) -> V,
     {
         Folder {
             unfolded: self.unfolded.cdr,
             folded: Cons {
-                car: FNode {
+                car: FoldNode {
                     source: self.unfolded.car.source,
                     fold_ok,
                     fold_err,
@@ -119,18 +133,22 @@ impl<S, P, R, F, Q, GO, GE, L, RA, RD, U, V> Folder<Cons<Node<S, (S, P)>, R>, Co
             _marker: PhantomData,
         }
     }
+
+    fn fold_id(self) -> Folder<R, Cons<FoldNode<S, fn(U) -> U, fn(V) -> V, (Q, L), RD>, Cons<FoldNode<Q, GO, GE, L, (RA, RD)>, F>>, U, V> {
+        self.fold(id, id)
+    }
 }
 
 impl<B, U, V> Folder<Nil, B, U, V> {
-    fn finish(self) -> Ready<B, U, V> {
-        Ready {
+    fn finish(self) -> BlenderReady<B, U, V> {
+        BlenderReady {
             blender: Some(self.folded),
             _marker: PhantomData,
         }
     }
 }
 
-struct Ready<B, U, V> {
+struct BlenderReady<B, U, V> {
     blender: Option<B>,
     _marker: PhantomData<(U, V)>,
 }
@@ -149,7 +167,7 @@ impl Decompose for Nil {
     }
 }
 
-impl<S, FO, FE, L, R, P> Decompose for Cons<FNode<S, FO, FE, L, R>, P> where P: Decompose {
+impl<S, FO, FE, L, R, P> Decompose for Cons<FoldNode<S, FO, FE, L, R>, P> where P: Decompose {
     type Parts = (S, P::Parts);
 
     fn decompose(self) -> Self::Parts {
@@ -248,21 +266,21 @@ impl<U, V, A> Probe<U, V, A> for Nil {
     }
 }
 
-impl<U, V, S, FO, FE, L, R, P> Probe<U, V, R> for Cons<FNode<S, FO, FE, L, R>, P>
+impl<U, V, S, FO, FE, L, R, P> Probe<U, V, R> for Cons<FoldNode<S, FO, FE, L, R>, P>
 where P: Probe<U, V, (S, R)> + Decompose<Parts = L>,
       S: Source,
       FO: Fn(S::Item) -> U,
       FE: Fn(ErrorEvent<L, S::Depleted, R, S::Error>) -> V,
 {
     fn probe(self, tail: R) -> OwnedPoll<U, V, Self, R> {
-        let Cons { car: FNode { source, fold_ok, fold_err, .. }, cdr, } = self;
+        let Cons { car: FoldNode { source, fold_ok, fold_err, .. }, cdr, } = self;
         match cdr.probe((source, tail)) {
             OwnedPoll::NotReady { me: cdr, tail: (source, tail), } => {
                 match source.source_poll() {
                     SourcePoll::NotReady(source) =>
                         OwnedPoll::NotReady {
                             me: Cons {
-                                car: FNode { source, fold_ok, fold_err, _zipper: PhantomData, },
+                                car: FoldNode { source, fold_ok, fold_err, _zipper: PhantomData, },
                                 cdr,
                             },
                             tail,
@@ -271,7 +289,7 @@ where P: Probe<U, V, (S, R)> + Decompose<Parts = L>,
                         let folded_ok = fold_ok(item);
                         OwnedPoll::Ready {
                             folded_ok,
-                            me: Cons { car: FNode { source, fold_ok, fold_err, _zipper: PhantomData, }, cdr, },
+                            me: Cons { car: FoldNode { source, fold_ok, fold_err, _zipper: PhantomData, }, cdr, },
                             tail,
                         }
                     },
@@ -303,7 +321,7 @@ where P: Probe<U, V, (S, R)> + Decompose<Parts = L>,
                 }
             },
             OwnedPoll::Ready { folded_ok, me: cdr, tail: (source, tail), } =>
-                OwnedPoll::Ready { folded_ok, me: Cons { car: FNode { source, fold_ok, fold_err, _zipper: PhantomData, }, cdr, }, tail, },
+                OwnedPoll::Ready { folded_ok, me: Cons { car: FoldNode { source, fold_ok, fold_err, _zipper: PhantomData, }, cdr, }, tail, },
             OwnedPoll::Depleted { folded_err, } =>
                 OwnedPoll::Depleted { folded_err, },
             OwnedPoll::Error { folded_err, } =>
@@ -312,12 +330,12 @@ where P: Probe<U, V, (S, R)> + Decompose<Parts = L>,
     }
 }
 
-impl<U, V, B> Future for Ready<B, U, V> where B: Probe<U, V, ()> {
+impl<U, V, B> Future for BlenderReady<B, U, V> where B: Probe<U, V, ()> {
     type Item = (U, Self);
     type Error = V;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        let blender = self.blender.take().expect("cannot poll Ready twice");
+        let blender = self.blender.take().expect("cannot poll BlenderReady twice");
         match blender.probe(()) {
             OwnedPoll::NotReady { me, tail: (), } => {
                 self.blender = Some(me);
@@ -326,7 +344,7 @@ impl<U, V, B> Future for Ready<B, U, V> where B: Probe<U, V, ()> {
             OwnedPoll::Ready { folded_ok, me, tail: (), } => {
                 Ok(Async::Ready((
                     folded_ok,
-                    Ready {
+                    BlenderReady {
                         blender: Some(me),
                         _marker: PhantomData,
                     },
@@ -348,162 +366,214 @@ mod tests {
     };
     use futures::{
         Future,
-        stream,
+        future::Either,
+        stream::{
+            self,
+            futures_unordered,
+        },
     };
     use tokio::timer::Delay;
-    use super::Blender;
+    use super::{
+        Gone,
+        Blender,
+        ErrorEvent,
+        DecomposeZip,
+    };
 
     #[test]
     fn blend_3_stream() {
-        let stream_a = stream::iter_ok(vec![0, 1, 2]);
-        let stream_b = stream::iter_ok(vec![true, false]);
-        let stream_c = stream::iter_ok(vec!["5"]);
+        let stream_a = stream::iter_ok::<_, ()>(vec![0, 1, 2]);
+        let stream_b = stream::iter_ok::<_, ()>(vec![true, false]);
+        let stream_c = stream::iter_ok::<_, ()>(vec!["5"]);
 
         #[derive(PartialEq, Debug)]
         enum Var3<A, B, C> { A(A), B(B), C(C), }
 
         let blender = Blender::new()
-            .add_stream(stream_a, Var3::A, |()| ())
-            .add_stream(stream_b, Var3::B, |()| ())
-            .add_stream(stream_c, Var3::C, |()| ());
-
-        let (item, blender) = blender.wait().map_err(|e| e.0).unwrap().unwrap();
-        assert_eq!(item, Var3::A(Some(0)));
-        let (item, blender) = blender.wait().map_err(|e| e.0).unwrap().unwrap();
-        assert_eq!(item, Var3::A(Some(1)));
-        let (item, blender) = blender.wait().map_err(|e| e.0).unwrap().unwrap();
-        assert_eq!(item, Var3::A(Some(2)));
-        let (item, blender) = blender.wait().map_err(|e| e.0).unwrap().unwrap();
-        assert_eq!(item, Var3::A(None));
-        let (item, blender) = blender.wait().map_err(|e| e.0).unwrap().unwrap();
-        assert_eq!(item, Var3::B(Some(true)));
-        let (item, blender) = blender.wait().map_err(|e| e.0).unwrap().unwrap();
-        assert_eq!(item, Var3::B(Some(false)));
-        let (item, blender) = blender.wait().map_err(|e| e.0).unwrap().unwrap();
-        assert_eq!(item, Var3::B(None));
-        let (item, blender) = blender.wait().map_err(|e| e.0).unwrap().unwrap();
-        assert_eq!(item, Var3::C(Some("5")));
-        let (item, blender) = blender.wait().map_err(|e| e.0).unwrap().unwrap();
-        assert_eq!(item, Var3::C(None));
-        let next = blender.wait().map_err(|e| e.0).unwrap();
-        assert!(next.is_none());
+            .add(stream_a)
+            .add(stream_b)
+            .add(stream_c)
+            .finish_sources()
+            .fold(Var3::C, Var3::C)
+            .fold(Var3::B, Var3::B)
+            .fold(Var3::A, Var3::A)
+            .finish();
+        let blender = match blender.wait() {
+            Ok((Var3::C("5"), blender)) => blender,
+            _other => panic!("unexpected wait result"),
+        };
+        let (stream_a, stream_b) = match blender.wait() {
+            Err(Var3::C(ErrorEvent::Depleted { decomposed: DecomposeZip { left_dir: (), myself: Gone, right_rev: (stream_b, (stream_a, ())), }, })) =>
+                (stream_a, stream_b),
+            _other => panic!("unexpected wait result"),
+        };
+        let blender = Blender::new()
+            .add(stream_a)
+            .add(stream_b)
+            .finish_sources()
+            .fold(Either::B, Either::B)
+            .fold(Either::A, Either::A)
+            .finish();
+        let blender = match blender.wait() {
+            Ok((Either::B(true), blender)) => blender,
+            _other => panic!("unexpected wait result"),
+        };
+        let blender = match blender.wait() {
+            Ok((Either::B(false), blender)) => blender,
+            _other => panic!("unexpected wait result"),
+        };
+        let stream_a = match blender.wait() {
+            Err(Either::B(ErrorEvent::Depleted { decomposed: DecomposeZip { left_dir: (), myself: Gone, right_rev: (stream_a, ()), }, })) =>
+                stream_a,
+            _other => panic!("unexpected wait result"),
+        };
+        let blender = Blender::new()
+            .add(stream_a)
+            .finish_sources()
+            .fold_id()
+            .finish();
+        let blender = match blender.wait() {
+            Ok((0, blender)) => blender,
+            _other => panic!("unexpected wait result"),
+        };
+        let blender = match blender.wait() {
+            Ok((1, blender)) => blender,
+            _other => panic!("unexpected wait result"),
+        };
+        let blender = match blender.wait() {
+            Ok((2, blender)) => blender,
+            _other => panic!("unexpected wait result"),
+        };
+        match blender.wait() {
+            Err(ErrorEvent::Depleted { decomposed: DecomposeZip { left_dir: (), myself: Gone, right_rev: (), }, }) => (),
+            _other => panic!("unexpected wait result"),
+        }
     }
 
-    #[test]
-    fn blend_3_gen() {
-        let stream_a = stream::iter_ok(vec![0, 1, 2]);
-        let stream_b = stream::iter_ok(vec![true, false]);
-        let stream_c = stream::iter_ok(vec!["5"]);
+    fn blend_3_mix() {
+        let stream_a = stream::iter_ok::<_, ()>(vec![0u8, 1, 2]);
+        let stream_b = stream::iter_ok::<_, ()>(vec![true, false]);
+        let stream_c = stream::iter_ok::<_, ()>(vec!["5"]);
 
-        #[derive(PartialEq, Debug)]
-        enum Var3<A, B, C> { A(A), B(B), C(C), }
+        // let blender_a = Blender::new()
+        //     .add(stream_a)
+        //     .finish_sources()
+        //     .fold_id()
+        //     .finish();
 
-        use futures::Stream;
-        let blender = Blender::new()
-            .add_gen_future(stream_a.into_future(), Stream::into_future, Var3::A, |()| ())
-            .add_stream(stream_b, Var3::B, |()| ())
-            .add_gen_future(stream_c.into_future(), Stream::into_future, Var3::C, |()| ());
+        // #[derive(PartialEq, Debug)]
+        // enum Var3<A, B, C> { A(A), B(B), C(C), }
 
-        let (item, blender) = blender.wait().map_err(|e| e.0).unwrap().unwrap();
-        assert_eq!(item, Var3::A(Some(0)));
-        let (item, blender) = blender.wait().map_err(|e| e.0).unwrap().unwrap();
-        assert_eq!(item, Var3::A(Some(1)));
-        let (item, blender) = blender.wait().map_err(|e| e.0).unwrap().unwrap();
-        assert_eq!(item, Var3::A(Some(2)));
-        let (item, blender) = blender.wait().map_err(|e| e.0).unwrap().unwrap();
-        assert_eq!(item, Var3::A(None));
-        let (item, blender) = blender.wait().map_err(|e| e.0).unwrap().unwrap();
-        assert_eq!(item, Var3::B(Some(true)));
-        let (item, blender) = blender.wait().map_err(|e| e.0).unwrap().unwrap();
-        assert_eq!(item, Var3::B(Some(false)));
-        let (item, blender) = blender.wait().map_err(|e| e.0).unwrap().unwrap();
-        assert_eq!(item, Var3::B(None));
-        let (item, blender) = blender.wait().map_err(|e| e.0).unwrap().unwrap();
-        assert_eq!(item, Var3::C(Some("5")));
-        let (item, blender) = blender.wait().map_err(|e| e.0).unwrap().unwrap();
-        assert_eq!(item, Var3::C(None));
-        let next = blender.wait().map_err(|e| e.0).unwrap();
-        assert!(next.is_none());
+        // let blender = Blender::new()
+        //     .add(stream_a)
+        //     .add(stream_b)
+        //     .add(stream_c)
+        //     .finish_sources()
+        //     .fold(Var3::C, Var3::C)
+        //     .fold(Var3::B, Var3::B)
+        //     .fold(Var3::A, Var3::A)
+        //     .finish();
+        // let blender = match blender.wait() {
+        //     Ok((Var3::C("5"), blender)) => blender,
+        //     _other => panic!("unexpected wait result"),
+        // };
+        // let (stream_a, stream_b) = match blender.wait() {
+        //     Err(Var3::C(ErrorEvent::Depleted { decomposed: DecomposeZip { left_dir: (), myself: Gone, right_rev: (stream_b, (stream_a, ())), }, })) =>
+        //         (stream_a, stream_b),
+        //     _other => panic!("unexpected wait result"),
+        // };
+        // let blender = Blender::new()
+        //     .add(stream_a)
+        //     .add(stream_b)
+        //     .finish_sources()
+        //     .fold(Either::B, Either::B)
+        //     .fold(Either::A, Either::A)
+        //     .finish();
+        // let blender = match blender.wait() {
+        //     Ok((Either::B(true), blender)) => blender,
+        //     _other => panic!("unexpected wait result"),
+        // };
+        // let blender = match blender.wait() {
+        //     Ok((Either::B(false), blender)) => blender,
+        //     _other => panic!("unexpected wait result"),
+        // };
+        // let stream_a = match blender.wait() {
+        //     Err(Either::B(ErrorEvent::Depleted { decomposed: DecomposeZip { left_dir: (), myself: Gone, right_rev: (stream_a, ()), }, })) =>
+        //         stream_a,
+        //     _other => panic!("unexpected wait result"),
+        // };
+        // let blender = Blender::new()
+        //     .add(stream_a)
+        //     .finish_sources()
+        //     .fold(|x| x, |x| x)
+        //     .finish();
+        // let blender = match blender.wait() {
+        //     Ok((0, blender)) => blender,
+        //     _other => panic!("unexpected wait result"),
+        // };
+        // let blender = match blender.wait() {
+        //     Ok((1, blender)) => blender,
+        //     _other => panic!("unexpected wait result"),
+        // };
+        // let blender = match blender.wait() {
+        //     Ok((2, blender)) => blender,
+        //     _other => panic!("unexpected wait result"),
+        // };
+        // match blender.wait() {
+        //     Err(ErrorEvent::Depleted { decomposed: DecomposeZip { left_dir: (), myself: Gone, right_rev: (), }, }) => (),
+        //     _other => panic!("unexpected wait result"),
+        // }
     }
 
     #[test]
     fn blend_delays() {
-        use futures::{
-            future::Either,
-            stream::futures_unordered,
-        };
-
-        let stream_ok = futures_unordered(vec![
+        let stream_a = futures_unordered(vec![
             Either::A(Delay::new(Instant::now() + Duration::from_millis(200)).map(|_| 0)),
             Either::B(Delay::new(Instant::now() + Duration::from_millis(100)).map(|_| 1)),
         ]);
-        let stream_err = futures_unordered(vec![
+        let stream_b = futures_unordered(vec![
             Either::A(Delay::new(Instant::now() + Duration::from_millis(300)).map(|_| "a")),
             Either::B(Delay::new(Instant::now() + Duration::from_millis(50)).map(|_| "b")),
         ]);
 
-        let blender = Blender::new()
-            .add_stream(stream_ok, Ok, |x| x)
-            .add_stream(stream_err, Err, |x| x);
-
         let mut runtime = tokio::runtime::Runtime::new().unwrap();
 
-        let (item, blender) = runtime.block_on(blender.map_err(|e| e.0)).unwrap().unwrap();
-        assert_eq!(item, Err(Some("b")));
-        let (item, blender) = runtime.block_on(blender.map_err(|e| e.0)).unwrap().unwrap();
-        assert_eq!(item, Ok(Some(1)));
-        let (item, blender) = runtime.block_on(blender.map_err(|e| e.0)).unwrap().unwrap();
-        assert_eq!(item, Ok(Some(0)));
-        let (item, blender) = runtime.block_on(blender.map_err(|e| e.0)).unwrap().unwrap();
-        assert_eq!(item, Ok(None));
-        let (item, blender) = runtime.block_on(blender.map_err(|e| e.0)).unwrap().unwrap();
-        assert_eq!(item, Err(Some("a")));
-        let (item, blender) = runtime.block_on(blender.map_err(|e| e.0)).unwrap().unwrap();
-        assert_eq!(item, Err(None));
-        let next = runtime.block_on(blender.map_err(|e| e.0)).unwrap();
-        assert!(next.is_none());
-    }
-
-    #[test]
-    fn blend_loop() {
-        let stream_a = stream::iter_ok(vec![2, 3, 4]);
-        let stream_b = stream::iter_ok(vec![true, false]);
-        let stream_c = stream::iter_ok(vec!["5"]);
-
-        #[derive(PartialEq, Debug)]
-        enum Var3<A, B, C> { A(A), B(B), C(C), }
-
         let blender = Blender::new()
-            .add_stream(stream_a, Var3::A, |()| ())
-            .add_stream(stream_b, Var3::B, |()| ())
-            .add_stream(stream_c, Var3::C, |()| ());
-
-        use futures::future::{loop_fn, Loop};
-
-        let future = loop_fn((blender, 0), |(blender, counter)| {
-            blender
-                .map_err(|((), _blender)| ())
-                .map(move |next| {
-                match next {
-                    None =>
-                        Loop::Break(counter),
-                    Some((Var3::A(None), blender)) =>
-                        Loop::Continue((blender, counter)),
-                    Some((Var3::A(Some(value)), blender)) =>
-                        Loop::Continue((blender, counter + value)),
-                    Some((Var3::B(None), blender)) =>
-                        Loop::Continue((blender, counter)),
-                    Some((Var3::B(Some(false)), blender)) =>
-                        Loop::Continue((blender, counter)),
-                    Some((Var3::B(Some(true)), blender)) =>
-                        Loop::Continue((blender, counter + 1)),
-                    Some((Var3::C(None), blender)) =>
-                        Loop::Continue((blender, counter)),
-                    Some((Var3::C(Some(string)), blender)) =>
-                        Loop::Continue((blender, counter + string.parse::<i32>().unwrap())),
-                }
-            })
-        });
-        assert_eq!(future.wait().unwrap(), 15);
+            .add(stream_a)
+            .add(stream_b)
+            .finish_sources()
+            .fold(Either::B, Either::B)
+            .fold(Either::A, Either::A)
+            .finish();
+        let blender = match runtime.block_on(blender) {
+            Ok((Either::B("b"), blender)) => blender,
+            _other => panic!("unexpected wait result"),
+        };
+        let blender = match runtime.block_on(blender) {
+            Ok((Either::A(1), blender)) => blender,
+            _other => panic!("unexpected wait result"),
+        };
+        let blender = match runtime.block_on(blender) {
+            Ok((Either::A(0), blender)) => blender,
+            _other => panic!("unexpected wait result"),
+        };
+        let stream_b = match runtime.block_on(blender) {
+            Err(Either::A(ErrorEvent::Depleted { decomposed: DecomposeZip { left_dir: (stream_b, ()), myself: Gone, right_rev: (), }, })) =>
+                stream_b,
+            _other => panic!("unexpected wait result"),
+        };
+        let blender = Blender::new()
+            .add(stream_b)
+            .finish_sources()
+            .fold_id()
+            .finish();
+        let blender = match runtime.block_on(blender) {
+            Ok(("a", blender)) => blender,
+            _other => panic!("unexpected wait result"),
+        };
+        match runtime.block_on(blender) {
+            Err(ErrorEvent::Depleted { decomposed: DecomposeZip { left_dir: (), myself: Gone, right_rev: (), }, }) => (),
+            _other => panic!("unexpected wait result"),
+        }
     }
 }
