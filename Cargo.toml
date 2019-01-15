@@ -1,6 +1,6 @@
 [package]
 name = "erlust"
-version = "0.4.3"
+version = "0.5.2"
 authors = ["Alexey Voznyuk <me@swizard.info>"]
 description = "Erlang-inspired framework for organizing async code in a fault-tolerant way"
 edition = "2018"

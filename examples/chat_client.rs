@@ -38,6 +38,14 @@ use erlust::{
         UsingResource,
     },
     net::tcp::tcp_stream,
+    blend::{
+        Gone,
+        Blender,
+        Decompose,
+        ErrorEvent,
+        DecomposeZip,
+        FutureGenerator,
+    },
 };
 
 fn main() {
@@ -76,7 +84,7 @@ fn main() {
     let client_future = tcp_stream_lode
         .resource
         .using_resource_loop(
-            (stdin_resource.steal_resource(), lode::LodeResource::steal_resource),
+            FutureGenerator { future: stdin_resource.steal_resource(), next: lode::LodeResource::steal_resource, },
             using_loop,
         )
         .then(|result| {
@@ -103,9 +111,9 @@ fn main() {
 
 fn using_loop<TS, SF, F>(
     tcp_stream: TS,
-    (stdin_steal, mk_stdin_steal): (SF, F),
+    stdin_gen: FutureGenerator<SF, F>,
 )
-    -> impl Future<Item = (UsingResource<TS>, Loop<(), (SF, F)>), Error = ErrorSeverity<(SF, F), ()>>
+    -> impl Future<Item = (UsingResource<TS>, Loop<(), FutureGenerator<SF, F>>), Error = ErrorSeverity<FutureGenerator<SF, F>, ()>>
 where TS: tokio::io::AsyncRead + tokio::io::AsyncWrite,
       SF: Future<Item = (Option<String>, lode::LodeResource<Option<String>>), Error = ()>,
       F: Fn(lode::LodeResource<Option<String>>) -> SF,
@@ -117,58 +125,66 @@ where TS: tokio::io::AsyncRead + tokio::io::AsyncWrite,
     let (tcp_stream_lines_tx, tcp_stream_lines_rx) =
         tcp_stream_lines.split();
 
-    let future = future::loop_fn(
-        (
-            tcp_stream_lines_rx.into_future(),
-            tcp_stream_lines_tx,
-            stdin_steal,
-            mk_stdin_steal,
-        ),
-        |(tcp_rx, tcp_tx, stdin_steal, mk_stdin_steal)| {
-            stdin_steal
-                .select2(tcp_rx)
-                .then(move |result| {
-                    match result {
-                        Ok(Either::A(((Some(line), stdin_resource), tcp_rx))) => {
-                            debug!("STDIN: here comes a line: {:?}", line);
-                            let future = tcp_tx.send(line)
-                                .then(move |send_result| {
-                                    let stdin_steal = mk_stdin_steal(stdin_resource);
-                                    match send_result {
-                                        Ok(tcp_tx) =>
-                                            Ok(Loop::Continue((tcp_rx, tcp_tx, stdin_steal, mk_stdin_steal))),
-                                        Err(error) => {
-                                            error!("TCP: send: {:?}", error);
-                                            Err(ErrorSeverity::Recoverable { state: (stdin_steal, mk_stdin_steal), })
-                                        },
-                                    }
-                                });
-                            Either::A(future)
-                        },
-                        Ok(Either::A(((None, stdin_resource), tcp_rx))) => {
-                            warn!("STDIN: unexpected stream termination, proceeding");
-                            Either::B(future::result(Ok(Loop::Continue((tcp_rx, tcp_tx, mk_stdin_steal(stdin_resource), mk_stdin_steal)))))
-                        },
-                        Ok(Either::B(((Some(line), tcp_rx), stdin_steal))) => {
-                            debug!("TCP: here comes a line: {:?}", line);
-                            println!("{}", line);
-                            Either::B(future::result(Ok(Loop::Continue((tcp_rx.into_future(), tcp_tx, stdin_steal, mk_stdin_steal)))))
-                        },
-                        Ok(Either::B(((None, _tcp_rx), stdin_steal))) => {
-                            info!("TCP: broken pipe");
-                            Either::B(future::result(Ok(Loop::Break(Loop::Continue((stdin_steal, mk_stdin_steal))))))
-                        },
-                        Err(Either::A(((), _tcp_rx))) => {
-                            error!("STDIN task dropped channel endpoint");
-                            Either::B(future::result(Ok(Loop::Break(Loop::Break(())))))
-                        },
-                        Err(Either::B(((error, _tcp_rx), stdin_steal))) => {
-                            error!("TCP: {:?}", error);
-                            Either::B(future::result(Err(ErrorSeverity::Recoverable { state: (stdin_steal, mk_stdin_steal), })))
-                        },
-                    }
-                })
-        },
-    );
-    future.map(|action| (UsingResource::Lost, action))
+    let blender = Blender::new()
+        .add(stdin_gen)
+        .add(tcp_stream_lines_rx)
+        .finish_sources()
+        .fold(Either::B, Either::B)
+        .fold(Either::A, Either::A)
+        .finish();
+
+    future::loop_fn((blender, tcp_stream_lines_tx), |(blender, tcp_tx)| {
+        blender
+            .then(move |result| {
+                match result {
+                    Ok((Either::A(line), blender)) => {
+                        debug!("STDIN: here comes a line: {:?}", line);
+                        let future = tcp_tx.send(line)
+                            .then(move |send_result| {
+                                match send_result {
+                                    Ok(tcp_tx) =>
+                                        Ok(Loop::Continue((blender, tcp_tx))),
+                                    Err(error) => {
+                                        error!("TCP: send: {:?}", error);
+                                        let (stdin_gen, (_tcp_rx, ())) = blender.decompose();
+                                        Err(ErrorSeverity::Recoverable { state: stdin_gen, })
+                                    },
+                                }
+                            });
+                        Either::A(future)
+                    },
+                    Ok((Either::B(line), blender)) => {
+                        debug!("TCP: here comes a line: {:?}", line);
+                        println!("{}", line);
+                        Either::B(future::result(Ok(Loop::Continue((blender, tcp_tx)))))
+                    },
+                    Err(Either::A(ErrorEvent::Depleted {
+                        decomposed: DecomposeZip { left_dir: (_tcp_rx, ()), myself: (_stdin_resource, _mk_stdin_steal), right_rev: (), },
+                    })) => {
+                        warn!("STDIN: unexpected stream termination, shutting down");
+                        Either::B(future::result(Ok(Loop::Break(Loop::Break(())))))
+                    },
+                    Err(Either::B(ErrorEvent::Depleted {
+                        decomposed: DecomposeZip { left_dir: (), myself: Gone, right_rev: (stdin_gen, ()), },
+                    })) => {
+                        info!("TCP: broken pipe");
+                        Either::B(future::result(Ok(Loop::Break(Loop::Continue(stdin_gen)))))
+                    },
+                    Err(Either::A(ErrorEvent::Error {
+                        error: (),
+                        decomposed: DecomposeZip { left_dir: (_tcp_rx, ()), myself: Gone, right_rev: (), },
+                    })) => {
+                        error!("STDIN task dropped channel endpoint");
+                        Either::B(future::result(Ok(Loop::Break(Loop::Break(())))))
+                    },
+                    Err(Either::B(ErrorEvent::Error {
+                        error,
+                        decomposed: DecomposeZip { left_dir: (), myself: Gone, right_rev: (stdin_gen, ()), },
+                    })) => {
+                        error!("TCP: {:?}", error);
+                        Either::B(future::result(Err(ErrorSeverity::Recoverable { state: stdin_gen, })))
+                    },
+                }
+            })
+    }).map(|action| (UsingResource::Lost, action))
 }

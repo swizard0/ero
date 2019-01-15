@@ -8,31 +8,31 @@ use futures::{
 use std::marker::PhantomData;
 
 #[derive(Debug)]
-struct Nil;
+pub struct Nil;
 
 #[derive(Debug)]
-struct Cons<A, D> {
+pub struct Cons<A, D> {
     car: A,
     cdr: D,
 }
 
-struct SourceNode<S, O> {
+pub struct SourceNode<S, O> {
     source: S,
     _parts: PhantomData<O>,
 }
 
-struct Blender<B> {
+pub struct Blender<B> {
     chain: B,
 }
 
 impl Blender<Nil> {
-    fn new() -> Blender<Nil> {
+    pub fn new() -> Blender<Nil> {
         Blender {
             chain: Nil,
         }
     }
 
-    fn add<S>(self, source: S) -> Blender<Cons<SourceNode<S, (S, ())>, Nil>> where S: Source {
+    pub fn add<S>(self, source: S) -> Blender<Cons<SourceNode<S, (S, ())>, Nil>> where S: Source {
         Blender {
             chain: Cons {
                 car: SourceNode {
@@ -46,7 +46,7 @@ impl Blender<Nil> {
 }
 
 impl<R, Q, P> Blender<Cons<SourceNode<Q, P>, R>> {
-    fn add<S>(self, source: S) -> Blender<Cons<SourceNode<S, (S, P)>, Cons<SourceNode<Q, P>, R>>> where S: Source {
+    pub fn add<S>(self, source: S) -> Blender<Cons<SourceNode<S, (S, P)>, Cons<SourceNode<Q, P>, R>>> where S: Source {
         Blender {
             chain: Cons {
                 car: SourceNode {
@@ -58,21 +58,21 @@ impl<R, Q, P> Blender<Cons<SourceNode<Q, P>, R>> {
         }
     }
 
-    fn finish_sources(self) -> FolderInit<Cons<SourceNode<Q, P>, R>> {
+    pub fn finish_sources(self) -> FolderInit<Cons<SourceNode<Q, P>, R>> {
         FolderInit {
             unfolded: self.chain,
         }
     }
 }
 
-struct FolderInit<N> {
+pub struct FolderInit<N> {
     unfolded: N,
 }
 
 fn id<T>(x: T) -> T { x }
 
 impl<S, P, R> FolderInit<Cons<SourceNode<S, (S, P)>, R>> {
-    fn fold<FO, FE, T, E, U, V>(self, fold_ok: FO, fold_err: FE) -> Folder<R, Cons<FoldNode<S, FO, FE, (), P>, Nil>, U, V>
+    pub fn fold<FO, FE, T, E, U, V>(self, fold_ok: FO, fold_err: FE) -> Folder<R, Cons<FoldNode<S, FO, FE, (), P>, Nil>, U, V>
     where FO: Fn(T) -> U,
           FE: Fn(E) -> V,
     {
@@ -91,18 +91,18 @@ impl<S, P, R> FolderInit<Cons<SourceNode<S, (S, P)>, R>> {
         }
     }
 
-    fn fold_id<U, V>(self) -> Folder<R, Cons<FoldNode<S, fn(U) -> U, fn(V) -> V, (), P>, Nil>, U, V> {
+    pub fn fold_id<U, V>(self) -> Folder<R, Cons<FoldNode<S, fn(U) -> U, fn(V) -> V, (), P>, Nil>, U, V> {
         self.fold(id, id)
     }
 }
 
-struct Folder<N, F, U, V> {
+pub struct Folder<N, F, U, V> {
     unfolded: N,
     folded: F,
     _marker: PhantomData<(U, V)>,
 }
 
-struct FoldNode<S, FO, FE, L, R> {
+pub struct FoldNode<S, FO, FE, L, R> {
     source: S,
     fold_ok: FO,
     fold_err: FE,
@@ -110,7 +110,7 @@ struct FoldNode<S, FO, FE, L, R> {
 }
 
 impl<S, P, R, F, Q, GO, GE, L, RA, RD, U, V> Folder<Cons<SourceNode<S, (S, P)>, R>, Cons<FoldNode<Q, GO, GE, L, (RA, RD)>, F>, U, V> {
-    fn fold<FO, FE, T, E>(
+    pub fn fold<FO, FE, T, E>(
         self,
         fold_ok: FO,
         fold_err: FE,
@@ -134,13 +134,13 @@ impl<S, P, R, F, Q, GO, GE, L, RA, RD, U, V> Folder<Cons<SourceNode<S, (S, P)>, 
         }
     }
 
-    fn fold_id(self) -> Folder<R, Cons<FoldNode<S, fn(U) -> U, fn(V) -> V, (Q, L), RD>, Cons<FoldNode<Q, GO, GE, L, (RA, RD)>, F>>, U, V> {
+    pub fn fold_id(self) -> Folder<R, Cons<FoldNode<S, fn(U) -> U, fn(V) -> V, (Q, L), RD>, Cons<FoldNode<Q, GO, GE, L, (RA, RD)>, F>>, U, V> {
         self.fold(id, id)
     }
 }
 
 impl<B, U, V> Folder<Nil, B, U, V> {
-    fn finish(self) -> BlenderReady<B, U, V> {
+    pub fn finish(self) -> BlenderReady<B, U, V> {
         BlenderReady {
             blender: Some(self.folded),
             _marker: PhantomData,
@@ -148,12 +148,12 @@ impl<B, U, V> Folder<Nil, B, U, V> {
     }
 }
 
-struct BlenderReady<B, U, V> {
+pub struct BlenderReady<B, U, V> {
     blender: Option<B>,
     _marker: PhantomData<(U, V)>,
 }
 
-trait Decompose {
+pub trait Decompose {
     type Parts;
 
     fn decompose(self) -> Self::Parts;
@@ -184,14 +184,14 @@ impl<B, U, V> Decompose for BlenderReady<B, U, V> where B: Decompose {
 }
 
 
-enum SourcePoll<T, N, D, E> {
+pub enum SourcePoll<T, N, D, E> {
     NotReady(N),
     Ready { item: T, next: N, },
     Depleted(D),
     Error(E),
 }
 
-trait Source: Sized {
+pub trait Source: Sized {
     type Item;
     type Depleted;
     type Error;
@@ -199,7 +199,7 @@ trait Source: Sized {
     fn source_poll(self) -> SourcePoll<Self::Item, Self, Self::Depleted, Self::Error>;
 }
 
-struct Gone;
+pub struct Gone;
 
 impl<S> Source for S where S: Stream {
     type Item = S::Item;
@@ -227,7 +227,7 @@ pub struct FutureGenerator<F, N> {
 
 impl<F, N, T, K> Source for FutureGenerator<F, N> where F: Future<Item = (Option<T>, K)>, N: Fn(K) -> F {
     type Item = T;
-    type Depleted = K;
+    type Depleted = (K, N);
     type Error = F::Error;
 
     fn source_poll(mut self) -> SourcePoll<Self::Item, Self, Self::Depleted, Self::Error> {
@@ -239,33 +239,32 @@ impl<F, N, T, K> Source for FutureGenerator<F, N> where F: Future<Item = (Option
                 SourcePoll::Ready { item, next: FutureGenerator { future: next_future, next: self.next, }, }
             },
             Ok(Async::Ready((None, kont))) =>
-                SourcePoll::Depleted(kont),
+                SourcePoll::Depleted((kont, self.next)),
             Err(error) =>
                 SourcePoll::Error(error),
         }
     }
 }
 
-enum OwnedPoll<U, V, S, R> {
+pub enum OwnedPoll<U, V, S, R> {
     NotReady { me: S, tail: R, },
     Ready { folded_ok: U, me: S, tail: R, },
     Depleted { folded_err: V, },
     Error { folded_err: V, },
 }
 
-#[derive(Debug)]
-struct DecomposeZip<DL, D, DR> {
-    left_dir: DL,
-    myself: D,
-    right_rev: DR,
+pub struct DecomposeZip<DL, D, DR> {
+    pub left_dir: DL,
+    pub myself: D,
+    pub right_rev: DR,
 }
 
-enum ErrorEvent<DL, D, DR, E> {
+pub enum ErrorEvent<DL, D, DR, E> {
     Depleted { decomposed: DecomposeZip<DL, D, DR>, },
     Error { error: E, decomposed: DecomposeZip<DL, Gone, DR>, },
 }
 
-trait Probe<U, V, A>: Sized {
+pub trait Probe<U, V, A>: Sized {
     fn probe(self, tail: A) -> OwnedPoll<U, V, Self, A>;
 }
 
@@ -302,13 +301,13 @@ where P: Probe<U, V, (S, R)> + Decompose<Parts = L>,
                             tail,
                         }
                     },
-                    SourcePoll::Depleted(depleted_token) => {
+                    SourcePoll::Depleted(myself) => {
                         let decomposed_left = cdr.decompose();
                         let decomposed_right = tail;
                         let folded_err = fold_err(ErrorEvent::Depleted {
                             decomposed: DecomposeZip {
                                 left_dir: decomposed_left,
-                                myself: depleted_token,
+                                myself,
                                 right_rev: decomposed_right,
                             },
                         });

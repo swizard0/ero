@@ -34,8 +34,11 @@ use super::{
     ErrorSeverity,
     RestartStrategy,
     blend::{
+        Gone,
         Blender,
         Decompose,
+        ErrorEvent,
+        DecomposeZip,
     },
 };
 
@@ -369,8 +372,12 @@ where FNA: FnMut(P) -> FA,
 {
     let OuterState { peers, core, state_avail, aquire_req_pending, } = outer_state;
     let blender = Blender::new()
-        .add_stream(peers.aquire_rx, Either::A, Either::A)
-        .add_stream(peers.release_rx, Either::B, Either::B);
+        .add(peers.aquire_rx)
+        .add(peers.release_rx)
+        .finish_sources()
+        .fold(Either::B, Either::B)
+        .fold(Either::A, Either::A)
+        .finish();
     loop_fn(MainState { blender, core, state_avail, aquire_req_pending, }, main_loop)
         .and_then(move |main_loop_result| {
             match main_loop_result {
@@ -427,6 +434,9 @@ struct MainState<FNA, FNRM, FNRW, FNCM, FNCW, N, R, P, B> {
     aquire_req_pending: Option<AquireReq<R>>,
 }
 
+type BlenderItem<R, B> = (Either<AquireReq<R>, ReleaseReq<R>>, B);
+type BlenderError<R> = Either<ErrorEvent<(ReleasePeer<R>, ()), Gone, (), ()>, ErrorEvent<(), Gone, (AquirePeer<R>, ()), ()>>;
+
 fn main_loop<FNA, FA, FNRM, FRM, FNRW, FRW, FNCM, FCM, FNCW, FCW, N, S, R, P, Q, B>(
     main_state: MainState<FNA, FNRM, FNRW, FNCM, FNCW, N, R, P, B>,
 )
@@ -442,8 +452,7 @@ where FNA: FnMut(P) -> FA,
       FNCW: FnMut(Q) -> FCW,
       FCW: IntoFuture<Item = S, Error = ()>,
       N: AsRef<str>,
-      B: Future<Item = Option<(Either<Option<AquireReq<R>>, Option<ReleaseReq<R>>>, B)>, Error = (Either<(), ()>, B)>
-    + Decompose<Parts = (ReleasePeer<R>, AquirePeer<R>)>,
+      B: Future<Item = BlenderItem<R, B>, Error = BlenderError<R>> + Decompose<Parts = (AquirePeer<R>, (ReleasePeer<R>, ()))>,
 {
     let MainState {
         core: Core { params, mut vtable, aquires_count, generation, },
@@ -515,7 +524,7 @@ where FNA: FnMut(P) -> FA,
                     let future = blender
                         .then(move |await_result| {
                             match await_result {
-                                Ok(Some((Either::A(Some(aquire_req)), blender))) => {
+                                Ok((Either::A(aquire_req), blender)) => {
                                     debug!("main_loop: aquire request");
                                     Either::B(result(Ok(Loop::Continue(MainState {
                                         core: Core { params, vtable, aquires_count, generation, },
@@ -524,11 +533,7 @@ where FNA: FnMut(P) -> FA,
                                         state_avail,
                                     }))))
                                 },
-                                Ok(Some((Either::A(None), _blender))) => {
-                                    debug!("main_loop: aquire channel depleted");
-                                    Either::B(result(Ok(Loop::Break(BreakMain::Shutdown))))
-                                },
-                                Ok(Some((Either::B(Some(release_req)), blender))) => {
+                                Ok((Either::B(release_req), blender)) => {
                                     if release_req.generation == generation {
                                         let maybe_resource = match release_req.status {
                                             ResourceStatus::Reimburse(resource) => {
@@ -557,12 +562,12 @@ where FNA: FnMut(P) -> FA,
                                                         Ok(Resource::Available(state_avail)) =>
                                                             Ok(Loop::Continue(MainState { blender, core, state_avail, aquire_req_pending: None, })),
                                                         Ok(Resource::OutOfStock(state_no_left)) => {
-                                                            let (release_rx, aquire_rx) = blender.decompose();
+                                                            let (aquire_rx, (release_rx, ())) = blender.decompose();
                                                             let peers = Peers { aquire_rx, release_rx, };
                                                             Ok(Loop::Break(BreakMain::WaitRelease { peers, core, state_no_left, }))
                                                         },
                                                         Err(ErrorSeverity::Recoverable { state: init_state, }) => {
-                                                            let (release_rx, aquire_rx) = blender.decompose();
+                                                            let (aquire_rx, (release_rx, ())) = blender.decompose();
                                                             let peers = Peers { aquire_rx, release_rx, };
                                                             Ok(Loop::Break(BreakMain::RequireRestart {
                                                                 peers, core, init_state, aquire_req_pending: None,
@@ -581,7 +586,7 @@ where FNA: FnMut(P) -> FA,
                                             let future = (vtable.close_main_fn)(state_avail)
                                                 .into_future()
                                                 .map(move |init_state| {
-                                                    let (release_rx, aquire_rx) = blender.decompose();
+                                                    let (aquire_rx, (release_rx, ())) = blender.decompose();
                                                     let peers = Peers { aquire_rx, release_rx, };
                                                     Loop::Break(BreakMain::RequireRestart {
                                                         core: Core {
@@ -606,19 +611,29 @@ where FNA: FnMut(P) -> FA,
                                         }))))
                                     }
                                 },
-                                Ok(Some((Either::B(None), _blender))) => {
-                                    debug!("main_loop: release channel depleted");
+                                Err(Either::A(ErrorEvent::Depleted {
+                                    decomposed: DecomposeZip { left_dir: (_release_rx, ()), myself: Gone, right_rev: (), },
+                                })) => {
+                                    debug!("main_loop: aquire channel depleted");
                                     Either::B(result(Ok(Loop::Break(BreakMain::Shutdown))))
                                 },
-                                Ok(None) => {
-                                    error!("main_loop: channels blender exhausted");
-                                    Either::B(result(Ok(Loop::Break(BreakMain::Shutdown))))
-                                },
-                                Err((Either::A(()), _blender)) => {
+                                Err(Either::A(ErrorEvent::Error {
+                                    error: (),
+                                    decomposed: DecomposeZip { left_dir: (_release_rx, ()), myself: Gone, right_rev: (), },
+                                })) => {
                                     debug!("main_loop: aquire channel outer endpoint dropped");
                                     Either::B(result(Ok(Loop::Break(BreakMain::Shutdown))))
                                 },
-                                Err((Either::B(()), _blender)) => {
+                                Err(Either::B(ErrorEvent::Depleted {
+                                    decomposed: DecomposeZip { left_dir: (), myself: Gone, right_rev: (_aquire_rx, ()), },
+                                })) => {
+                                    debug!("main_loop: release channel depleted");
+                                    Either::B(result(Ok(Loop::Break(BreakMain::Shutdown))))
+                                },
+                                Err(Either::B(ErrorEvent::Error {
+                                    error: (),
+                                    decomposed: DecomposeZip { left_dir: (), myself: Gone, right_rev: (_aquire_rx, ()), },
+                                })) => {
                                     debug!("main_loop: release channel outer endpoint dropped");
                                     Either::B(result(Ok(Loop::Break(BreakMain::Shutdown))))
                                 },
@@ -627,12 +642,12 @@ where FNA: FnMut(P) -> FA,
                     Either::A(future)
                 },
                 AquireProcess::WaitRelease { core, state_no_left, } => {
-                    let (release_rx, aquire_rx) = blender.decompose();
+                    let (aquire_rx, (release_rx, ())) = blender.decompose();
                     let peers = Peers { aquire_rx, release_rx, };
                     Either::B(result(Ok(Loop::Break(BreakMain::WaitRelease { peers, core, state_no_left, }))))
                 },
                 AquireProcess::RequireRestart { core, init_state, aquire_req_pending, } => {
-                    let (release_rx, aquire_rx) = blender.decompose();
+                    let (aquire_rx, (release_rx, ())) = blender.decompose();
                     let peers = Peers { aquire_rx, release_rx, };
                     Either::B(result(Ok(Loop::Break(BreakMain::RequireRestart { peers, core, init_state, aquire_req_pending, }))))
                 },
