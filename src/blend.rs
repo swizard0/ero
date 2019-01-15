@@ -175,6 +175,15 @@ impl<S, FO, FE, L, R, P> Decompose for Cons<FoldNode<S, FO, FE, L, R>, P> where 
     }
 }
 
+impl<B, U, V> Decompose for BlenderReady<B, U, V> where B: Decompose {
+    type Parts = B::Parts;
+
+    fn decompose(mut self) -> Self::Parts {
+        self.blender.take().expect("cannot decompose BlenderReady after future poll").decompose()
+    }
+}
+
+
 enum SourcePoll<T, N, D, E> {
     NotReady(N),
     Ready { item: T, next: N, },
@@ -597,5 +606,34 @@ mod tests {
             Err(ErrorEvent::Depleted { decomposed: DecomposeZip { left_dir: (), myself: Gone, right_rev: (), }, }) => (),
             _other => panic!("unexpected wait result"),
         }
+    }
+
+    #[test]
+    fn early_decompose() {
+        let stream_a = stream::iter_ok::<_, ()>(vec![0, 1, 2]);
+        let stream_b = stream::iter_ok::<_, ()>(vec![true, false]);
+
+        let blender = Blender::new()
+            .add(stream_a)
+            .add(stream_b)
+            .finish_sources()
+            .fold(Either::B, Either::B)
+            .fold(Either::A, Either::A)
+            .finish();
+        let blender = match blender.wait() {
+            Ok((Either::B(true), blender)) => blender,
+            _other => panic!("unexpected wait result"),
+        };
+
+        use futures::Async;
+        use super::Decompose;
+
+        let (mut stream_a, (mut stream_b, ())) = blender.decompose();
+        assert_eq!(Ok(Async::Ready(Some(0))), stream_a.poll());
+        assert_eq!(Ok(Async::Ready(Some(1))), stream_a.poll());
+        assert_eq!(Ok(Async::Ready(Some(2))), stream_a.poll());
+        assert_eq!(Ok(Async::Ready(None)), stream_a.poll());
+        assert_eq!(Ok(Async::Ready(Some(false))), stream_b.poll());
+        assert_eq!(Ok(Async::Ready(None)), stream_b.poll());
     }
 }
