@@ -14,13 +14,14 @@ use tokio::net::tcp::{
 use log::{debug, error};
 
 use super::super::super::{
+    Params as LodeParams,
     ErrorSeverity,
     lode::{self, Lode},
 };
 
 pub struct Params<N> {
     pub sock_addr: SocketAddr,
-    pub lode_params: lode::Params<N>,
+    pub lode_params: LodeParams<N>,
 }
 
 pub fn spawn<N>(

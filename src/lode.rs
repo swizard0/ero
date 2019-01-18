@@ -31,6 +31,7 @@ use tokio::timer::Delay;
 
 use super::{
     Loop,
+    Params,
     ErrorSeverity,
     RestartStrategy,
     blend::{
@@ -102,11 +103,6 @@ pub struct Lode<R> {
 pub enum Resource<P, Q> {
     Available(P),
     OutOfStock(Q),
-}
-
-pub struct Params<N> {
-    pub name: N,
-    pub restart_strategy: RestartStrategy,
 }
 
 pub fn spawn<FNI, FI, FNA, FA, FNRM, FRM, FNRW, FRW, FNCM, FCM, FNCW, FCW, N, S, R, P, Q>(
