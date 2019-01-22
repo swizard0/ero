@@ -21,7 +21,7 @@ use super::{
 fn check_sequence() {
     let _ = pretty_env_logger::try_init();
     let mut runtime = tokio::runtime::Runtime::new().unwrap();
-    let executor = runtime.executor();
+    let supervisor = super::super::supervisor::Supervisor::new(&runtime.executor());
 
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     enum Notify {
@@ -36,16 +36,8 @@ fn check_sequence() {
     struct ResourceItem;
 
     let (tx, rx) = mpsc::unbounded();
-    let super::Lode {
-        resource: super::LodeResource {
-            aquire_tx,
-            release_tx,
-        },
-        shutdown: super::LodeShutdown {
-            shutdown_tx,
-        },
-    } = super::spawn(
-        &executor,
+    let super::LodeResource { aquire_tx, release_tx, } = super::spawn_link(
+        &supervisor,
         super::Params {
             name: "check_sequence",
             restart_strategy: RestartStrategy::RestartImmediately,
@@ -84,25 +76,25 @@ fn check_sequence() {
     );
 
     let result: Result<(), ()> = runtime.block_on(
-        future::result(Ok((aquire_tx, release_tx, shutdown_tx, rx)))
-            .and_then(|(aquire_tx, release_tx, shutdown_tx, rx)| {
+        future::result(Ok((aquire_tx, release_tx, rx)))
+            .and_then(|(aquire_tx, release_tx, rx)| {
                 let (resource_tx, resource_rx) = oneshot::channel();
                 aquire_tx
                     .send(super::AquireReq { reply_tx: resource_tx, })
                     .then(|result| {
                         if let Ok(aquire_tx) = result {
-                            Ok((aquire_tx, release_tx, shutdown_tx, rx, resource_rx))
+                            Ok((aquire_tx, release_tx, rx, resource_rx))
                         } else {
                             panic!("aquire tx endpoint dropped unexpectedly");
                         }
                     })
             })
-            .and_then(|(aquire_tx, release_tx, shutdown_tx, rx, resource_rx)| {
+            .and_then(|(aquire_tx, release_tx, rx, resource_rx)| {
                 rx.into_future()
                     .then(|result| {
                         match result {
                             Ok((Some(Notify::InitFn), rx)) =>
-                                Ok((aquire_tx, release_tx, shutdown_tx, rx, resource_rx)),
+                                Ok((aquire_tx, release_tx, rx, resource_rx)),
                             Ok((other, _rx)) =>
                                 panic!("expected tracking rx to be InitFn but it is: {:?}", other),
                             Err(..) =>
@@ -110,12 +102,12 @@ fn check_sequence() {
                         }
                     })
             })
-            .and_then(|(aquire_tx, release_tx, shutdown_tx, rx, resource_rx)| {
+            .and_then(|(aquire_tx, release_tx, rx, resource_rx)| {
                 rx.into_future()
                     .then(|result| {
                         match result {
                             Ok((Some(Notify::AquireFn), rx)) =>
-                                Ok((aquire_tx, release_tx, shutdown_tx, rx, resource_rx)),
+                                Ok((aquire_tx, release_tx, rx, resource_rx)),
                             Ok((other, _rx)) =>
                                 panic!("expected tracking rx to be AquireFn but it is: {:?}", other),
                             Err(..) =>
@@ -123,12 +115,12 @@ fn check_sequence() {
                         }
                     })
             })
-            .and_then(|(aquire_tx, release_tx, shutdown_tx, rx, resource_rx)| {
+            .and_then(|(aquire_tx, release_tx, rx, resource_rx)| {
                 resource_rx
                     .then(|result| {
                         match result {
                             Ok(super::ResourceGen { generation: 1, resource: ResourceItem, }) =>
-                                Ok((aquire_tx, release_tx, shutdown_tx, rx)),
+                                Ok((aquire_tx, release_tx, rx)),
                             Ok(super::ResourceGen { generation, resource: ResourceItem, }) =>
                                 panic!("expected resource generation 1 but got {}", generation),
                             Err(..) =>
@@ -136,23 +128,23 @@ fn check_sequence() {
                         }
                     })
             })
-            .and_then(|(aquire_tx, release_tx, shutdown_tx, rx)| {
+            .and_then(|(aquire_tx, release_tx, rx)| {
                 release_tx
                     .send(super::ReleaseReq { generation: 1, status: super::ResourceStatus::Reimburse(ResourceItem), })
                     .then(|result| {
                         if let Ok(release_tx) = result {
-                            Ok((aquire_tx, release_tx, shutdown_tx, rx))
+                            Ok((aquire_tx, release_tx, rx))
                         } else {
                             panic!("release tx endpoint dropped unexpectedly");
                         }
                     })
             })
-            .and_then(|(aquire_tx, release_tx, shutdown_tx, rx)| {
+            .and_then(|(aquire_tx, release_tx, rx)| {
                 rx.into_future()
                     .then(|result| {
                         match result {
                             Ok((Some(Notify::ReleaseMainFn), rx)) =>
-                                Ok((aquire_tx, release_tx, shutdown_tx, rx)),
+                                Ok((aquire_tx, release_tx, rx)),
                             Ok((other, _rx)) =>
                                 panic!("expected tracking rx to be ReleaseFn but it is: {:?}", other),
                             Err(..) =>
@@ -160,24 +152,24 @@ fn check_sequence() {
                         }
                     })
             })
-            .and_then(|(aquire_tx, release_tx, shutdown_tx, rx)| {
+            .and_then(|(aquire_tx, release_tx, rx)| {
                 let (resource_tx, resource_rx) = oneshot::channel();
                 aquire_tx
                     .send(super::AquireReq { reply_tx: resource_tx, })
                     .then(|result| {
                         if let Ok(aquire_tx) = result {
-                            Ok((aquire_tx, release_tx, shutdown_tx, rx, resource_rx))
+                            Ok((aquire_tx, release_tx, rx, resource_rx))
                         } else {
                             panic!("aquire tx endpoint dropped unexpectedly");
                         }
                     })
             })
-            .and_then(|(aquire_tx, release_tx, shutdown_tx, rx, resource_rx)| {
+            .and_then(|(aquire_tx, release_tx, rx, resource_rx)| {
                 rx.into_future()
                     .then(|result| {
                         match result {
                             Ok((Some(Notify::AquireFn), rx)) =>
-                                Ok((aquire_tx, release_tx, shutdown_tx, rx, resource_rx)),
+                                Ok((aquire_tx, release_tx, rx, resource_rx)),
                             Ok((other, _rx)) =>
                                 panic!("expected tracking rx to be AquireFn but it is: {:?}", other),
                             Err(..) =>
@@ -185,12 +177,12 @@ fn check_sequence() {
                         }
                     })
             })
-            .and_then(|(aquire_tx, release_tx, shutdown_tx, rx, resource_rx)| {
+            .and_then(|(aquire_tx, release_tx, rx, resource_rx)| {
                 resource_rx
                     .then(|result| {
                         match result {
                             Ok(super::ResourceGen { generation: 1, resource: ResourceItem, }) =>
-                                Ok((aquire_tx, release_tx, shutdown_tx, rx)),
+                                Ok((aquire_tx, release_tx, rx)),
                             Ok(super::ResourceGen { generation, resource: ResourceItem, }) =>
                                 panic!("expected resource generation 1 but got {}", generation),
                             Err(..) =>
@@ -198,23 +190,23 @@ fn check_sequence() {
                         }
                     })
             })
-            .and_then(|(aquire_tx, release_tx, shutdown_tx, rx)| {
+            .and_then(|(aquire_tx, release_tx, rx)| {
                 release_tx
                     .send(super::ReleaseReq { generation: 1, status: super::ResourceStatus::ResourceFault, })
                     .then(|result| {
                         if let Ok(release_tx) = result {
-                            Ok((aquire_tx, release_tx, shutdown_tx, rx))
+                            Ok((aquire_tx, release_tx, rx))
                         } else {
                             panic!("release tx endpoint dropped unexpectedly");
                         }
                     })
             })
-            .and_then(|(aquire_tx, release_tx, shutdown_tx, rx)| {
+            .and_then(|(aquire_tx, release_tx, rx)| {
                 rx.into_future()
                     .then(|result| {
                         match result {
                             Ok((Some(Notify::CloseMainFn), rx)) =>
-                                Ok((aquire_tx, release_tx, shutdown_tx, rx)),
+                                Ok((aquire_tx, release_tx, rx)),
                             Ok((other, _rx)) =>
                                 panic!("expected tracking rx to be CloseFn but it is: {:?}", other),
                             Err(..) =>
@@ -222,24 +214,24 @@ fn check_sequence() {
                         }
                     })
             })
-            .and_then(|(aquire_tx, release_tx, shutdown_tx, rx)| {
+            .and_then(|(aquire_tx, release_tx, rx)| {
                 let (resource_tx, resource_rx) = oneshot::channel();
                 aquire_tx
                     .send(super::AquireReq { reply_tx: resource_tx, })
                     .then(|result| {
                         if let Ok(aquire_tx) = result {
-                            Ok((aquire_tx, release_tx, shutdown_tx, rx, resource_rx))
+                            Ok((aquire_tx, release_tx, rx, resource_rx))
                         } else {
                             panic!("aquire tx endpoint dropped unexpectedly");
                         }
                     })
             })
-            .and_then(|(aquire_tx, release_tx, shutdown_tx, rx, resource_rx)| {
+            .and_then(|(aquire_tx, release_tx, rx, resource_rx)| {
                 rx.into_future()
                     .then(|result| {
                         match result {
                             Ok((Some(Notify::InitFn), rx)) =>
-                                Ok((aquire_tx, release_tx, shutdown_tx, rx, resource_rx)),
+                                Ok((aquire_tx, release_tx, rx, resource_rx)),
                             Ok((other, _rx)) =>
                                 panic!("expected tracking rx to be InitFn but it is: {:?}", other),
                             Err(..) =>
@@ -247,12 +239,12 @@ fn check_sequence() {
                         }
                     })
             })
-            .and_then(|(aquire_tx, release_tx, shutdown_tx, rx, resource_rx)| {
+            .and_then(|(aquire_tx, release_tx, rx, resource_rx)| {
                 rx.into_future()
                     .then(|result| {
                         match result {
                             Ok((Some(Notify::AquireFn), rx)) =>
-                                Ok((aquire_tx, release_tx, shutdown_tx, rx, resource_rx)),
+                                Ok((aquire_tx, release_tx, rx, resource_rx)),
                             Ok((other, _rx)) =>
                                 panic!("expected tracking rx to be AquireFn but it is: {:?}", other),
                             Err(..) =>
@@ -260,12 +252,12 @@ fn check_sequence() {
                         }
                     })
             })
-            .and_then(|(aquire_tx, release_tx, shutdown_tx, rx, resource_rx)| {
+            .and_then(|(aquire_tx, release_tx, rx, resource_rx)| {
                 resource_rx
                     .then(|result| {
                         match result {
                             Ok(super::ResourceGen { generation: 2, resource: ResourceItem, }) =>
-                                Ok((aquire_tx, release_tx, shutdown_tx, rx)),
+                                Ok((aquire_tx, release_tx, rx)),
                             Ok(super::ResourceGen { generation, resource: ResourceItem, }) =>
                                 panic!("expected resource generation 2 but got {}", generation),
                             Err(..) =>
@@ -273,19 +265,19 @@ fn check_sequence() {
                         }
                     })
             })
-            .and_then(|(aquire_tx, release_tx, shutdown_tx, rx)| {
+            .and_then(|(aquire_tx, release_tx, rx)| {
                 release_tx
                     .send(super::ReleaseReq { generation: 1, status: super::ResourceStatus::ResourceLost, })
                     .then(|result| {
                         if let Ok(release_tx) = result {
-                            Ok((aquire_tx, release_tx, shutdown_tx, rx))
+                            Ok((aquire_tx, release_tx, rx))
                         } else {
                             panic!("release tx endpoint dropped unexpectedly");
                         }
                     })
             })
-            .and_then(move |(_aquire_tx, _release_tx, shutdown_tx, rx)| {
-                let _ = shutdown_tx.send(super::Shutdown);
+            .and_then(move |(_aquire_tx, _release_tx, rx)| {
+                std::mem::drop(supervisor);
                 rx.into_future()
                     .then(|result| {
                         match result {
@@ -305,11 +297,11 @@ fn check_sequence() {
 #[test]
 fn lode_stream() {
     let _ = pretty_env_logger::try_init();
-    let runtime = tokio::runtime::Runtime::new().unwrap();
-    let executor = runtime.executor();
+    let mut runtime = tokio::runtime::Runtime::new().unwrap();
+    let supervisor = super::super::supervisor::Supervisor::new(&runtime.executor());
 
-    let super::Lode { resource: stream_resource, shutdown: stream_shutdown, } = super::stream::spawn(
-        &executor,
+    let stream_resource = super::stream::spawn_link(
+        &supervisor,
         super::Params {
             name: "lode_stream",
             restart_strategy: RestartStrategy::RestartImmediately,
@@ -319,7 +311,8 @@ fn lode_stream() {
             Ok((futures::stream::iter_ok(vec.clone()), vec))
         },
     );
-    executor.spawn(
+
+    supervisor.spawn_link(
         stream_resource
             .steal_resource()
             .and_then(|(item, lode_stream)| {
@@ -340,10 +333,10 @@ fn lode_stream() {
             })
             .and_then(|(item, _lode_stream)| {
                 assert_eq!(item, Some(0));
-                stream_shutdown.shutdown();
                 Ok(())
             })
     );
 
-    let _ = runtime.shutdown_on_idle().wait();
+    supervisor.shutdown_on_idle(&mut runtime).unwrap();
+    runtime.shutdown_on_idle().wait().unwrap();
 }

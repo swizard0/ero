@@ -1,9 +1,13 @@
-#![type_length_limit="8388608"]
+#![type_length_limit="33554432"]
 
 use std::time::Duration;
 
-pub use futures::future::Loop;
+pub use futures::{
+    future::Loop,
+    sync::oneshot,
+};
 
+pub mod supervisor;
 pub mod restart;
 pub mod blend;
 pub mod lode;

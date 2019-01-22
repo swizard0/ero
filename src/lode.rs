@@ -41,6 +41,7 @@ use super::{
         ErrorEvent,
         DecomposeZip,
     },
+    supervisor::Supervisor,
 };
 
 pub mod uniq;
@@ -72,12 +73,6 @@ enum ResourceStatus<R> {
     ResourceFault,
 }
 
-struct Shutdown;
-
-pub struct LodeShutdown {
-    shutdown_tx: oneshot::Sender<Shutdown>,
-}
-
 type AquirePeer<R> = mpsc::Receiver<AquireReq<R>>;
 type ReleasePeer<R> = mpsc::UnboundedReceiver<ReleaseReq<R>>;
 
@@ -95,18 +90,13 @@ impl<R> Clone for LodeResource<R> {
     }
 }
 
-pub struct Lode<R> {
-    pub resource: LodeResource<R>,
-    pub shutdown: LodeShutdown,
-}
-
 pub enum Resource<P, Q> {
     Available(P),
     OutOfStock(Q),
 }
 
-pub fn spawn<FNI, FI, FNA, FA, FNRM, FRM, FNRW, FRW, FNCM, FCM, FNCW, FCW, N, S, R, P, Q>(
-    executor: &tokio::runtime::TaskExecutor,
+pub fn spawn_link<FNI, FI, FNA, FA, FNRM, FRM, FNRW, FRW, FNCM, FCM, FNCW, FCW, N, S, R, P, Q>(
+    supervisor: &Supervisor,
     params: Params<N>,
     init_state: S,
     init_fn: FNI,
@@ -116,7 +106,7 @@ pub fn spawn<FNI, FI, FNA, FA, FNRM, FRM, FNRW, FRW, FNCM, FCM, FNCW, FCW, N, S,
     close_main_fn: FNCM,
     close_wait_fn: FNCW,
 )
-    -> Lode<R>
+    -> LodeResource<R>
 where FNI: FnMut(S) -> FI + Send + 'static,
       FI: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>> + 'static,
       FI::Future: Send,
@@ -143,7 +133,6 @@ where FNI: FnMut(S) -> FI + Send + 'static,
 {
     let (aquire_tx_stream, aquire_rx_stream) = mpsc::channel(0);
     let (release_tx_stream, release_rx_stream) = mpsc::unbounded();
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     let task_future = loop_fn(
         RestartState {
@@ -169,33 +158,11 @@ where FNI: FnMut(S) -> FI + Send + 'static,
         },
         restart_loop,
     );
-    executor.spawn(
-        task_future
-            .select2(shutdown_rx)
-            .then(|result| {
-                match result {
-                    Ok(Either::A(((), _shutdown_rx))) =>
-                        Ok(()),
-                    Ok(Either::B((Shutdown, _task_future))) =>
-                        Ok(()),
-                    Err(Either::A(((), _shutdown_rx))) =>
-                        Err(()),
-                    Err(Either::B((oneshot::Canceled, _task_future))) => {
-                        debug!("shutdown channel outer endpoint dropped");
-                        Err(())
-                    },
-                }
-            })
-    );
+    supervisor.spawn_link(task_future);
 
-    Lode {
-        resource: LodeResource {
-            aquire_tx: aquire_tx_stream,
-            release_tx: release_tx_stream,
-        },
-        shutdown: LodeShutdown {
-            shutdown_tx,
-        },
+    LodeResource {
+        aquire_tx: aquire_tx_stream,
+        release_tx: release_tx_stream,
     }
 }
 
@@ -824,14 +791,6 @@ pub enum UsingError<E> {
 pub enum UsingResource<R> {
     Lost,
     Reimburse(R),
-}
-
-impl LodeShutdown {
-    pub fn shutdown(self) {
-        if let Err(..) = self.shutdown_tx.send(Shutdown) {
-            warn!("resource task is gone while performing shutdown");
-        }
-    }
 }
 
 impl<R> LodeResource<R> {

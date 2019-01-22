@@ -16,7 +16,8 @@ use log::{debug, error};
 use super::super::super::{
     Params as LodeParams,
     ErrorSeverity,
-    lode::{self, Lode},
+    supervisor::Supervisor,
+    lode::{self, LodeResource},
 };
 
 pub struct Params<N> {
@@ -24,17 +25,17 @@ pub struct Params<N> {
     pub lode_params: LodeParams<N>,
 }
 
-pub fn spawn<N>(
-    executor: &tokio::runtime::TaskExecutor,
+pub fn spawn_link<N>(
+    supervisor: &Supervisor,
     params: Params<N>,
 )
-    -> Lode<Option<TcpStream>>
+    -> LodeResource<Option<TcpStream>>
 where N: AsRef<str> + Send + 'static,
 {
     let Params { sock_addr, lode_params, } = params;
 
-    lode::stream::spawn(
-        executor,
+    lode::stream::spawn_link(
+        supervisor,
         lode_params,
         sock_addr,
         init,

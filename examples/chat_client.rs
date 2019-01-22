@@ -1,4 +1,4 @@
-#![type_length_limit="8388608"]
+#![type_length_limit="33554432"]
 
 use std::{
     time::Duration,
@@ -46,17 +46,18 @@ use ero::{
         DecomposeZip,
         FutureGenerator,
     },
+    supervisor::Supervisor,
 };
 
 fn main() {
     pretty_env_logger::init_timed();
-    let runtime = tokio::runtime::Runtime::new().unwrap();
-    let executor = runtime.executor();
+    let mut runtime = tokio::runtime::Runtime::new().unwrap();
+    let supervisor = Supervisor::new(&runtime.executor());
 
     info!("creating stdin task");
-    let lode::Lode { resource: stdin_resource, shutdown: stdin_shutdown, } = lode::stream::spawn(
-        &executor,
-        lode::Params {
+    let stdin_resource = lode::stream::spawn_link(
+        &supervisor,
+        ero::Params {
             name: "chat_client stdin",
             restart_strategy: RestartStrategy::RestartImmediately,
         },
@@ -71,9 +72,9 @@ fn main() {
     );
 
     info!("creating tcp_stream task");
-    let tcp_stream_lode = tcp_stream::spawn(&executor, tcp_stream::Params {
+    let tcp_stream_resource = tcp_stream::spawn_link(&supervisor, tcp_stream::Params {
         sock_addr: "127.0.0.1:4447".to_socket_addrs().unwrap().next().unwrap(),
-        lode_params: lode::Params {
+        lode_params: ero::Params {
             name: "chat_client tcp_stream",
             restart_strategy: RestartStrategy::Delay {
                 restart_after: Duration::from_secs(8),
@@ -81,14 +82,12 @@ fn main() {
         },
     });
 
-    let client_future = tcp_stream_lode
-        .resource
+    let client_future = tcp_stream_resource
         .using_resource_loop(
             FutureGenerator { future: stdin_resource.steal_resource(), next: lode::LodeResource::steal_resource, },
             using_loop,
         )
         .then(|result| {
-            stdin_shutdown.shutdown();
             match result {
                 Ok(((), _lode)) => {
                     info!("client terminated successfully");
@@ -104,8 +103,8 @@ fn main() {
                 },
             }
         });
-    executor.spawn(client_future);
-
+    supervisor.spawn_link(client_future);
+    supervisor.shutdown_on_idle(&mut runtime).unwrap();
     let _ = runtime.shutdown_on_idle().wait();
 }
 

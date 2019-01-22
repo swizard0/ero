@@ -9,14 +9,15 @@ use log::error;
 use super::{
     super::{
         ErrorSeverity,
+        supervisor::Supervisor,
     },
-    Lode,
+    LodeResource,
     Params,
     Resource,
 };
 
-pub fn spawn<FNI, FI, FNA, FA, FNRW, FRW, FNCM, FCM, FNCW, FCW, N, S, R, P, Q>(
-    executor: &tokio::runtime::TaskExecutor,
+pub fn spawn_link<FNI, FI, FNA, FA, FNRW, FRW, FNCM, FCM, FNCW, FCW, N, S, R, P, Q>(
+    supervisor: &Supervisor,
     params: Params<N>,
     init_state: S,
     mut init_fn: FNI,
@@ -25,7 +26,7 @@ pub fn spawn<FNI, FI, FNA, FA, FNRW, FRW, FNCM, FCM, FNCW, FCW, N, S, R, P, Q>(
     close_main_fn: FNCM,
     close_wait_fn: FNCW,
 )
-    -> Lode<R>
+    -> LodeResource<R>
 where FNI: FnMut(S) -> FI + Send + 'static,
       FI: IntoFuture<Item = P, Error = ErrorSeverity<S, ()>> + 'static,
       FI::Future: Send,
@@ -47,8 +48,8 @@ where FNI: FnMut(S) -> FI + Send + 'static,
       P: Send + 'static,
       Q: Send + 'static,
 {
-    super::spawn(
-        executor,
+    super::spawn_link(
+        supervisor,
         params,
         init_state,
         move |state_s| {

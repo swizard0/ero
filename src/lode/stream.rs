@@ -9,19 +9,20 @@ use log::{info, error};
 use super::{
     super::{
         ErrorSeverity,
+        supervisor::Supervisor,
     },
-    Lode,
+    LodeResource,
     Params,
     Resource,
 };
 
-pub fn spawn<FNI, FI, N, S, SR, R>(
-    executor: &tokio::runtime::TaskExecutor,
+pub fn spawn_link<FNI, FI, N, S, SR, R>(
+    supervisor: &Supervisor,
     params: Params<N>,
     init_state: S,
     mut init_fn: FNI,
 )
-    -> Lode<Option<R>>
+    -> LodeResource<Option<R>>
 where FNI: FnMut(S) -> FI + Send + 'static,
       FI: IntoFuture<Item = (SR, S), Error = ErrorSeverity<S, ()>> + 'static,
       FI::Future: Send,
@@ -31,8 +32,8 @@ where FNI: FnMut(S) -> FI + Send + 'static,
       SR: Send + 'static,
       R: Send + 'static,
 {
-    super::spawn(
-        executor,
+    super::spawn_link(
+        supervisor,
         params,
         init_state,
         move |state_s| {
