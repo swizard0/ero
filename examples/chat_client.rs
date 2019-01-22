@@ -1,4 +1,4 @@
-#![type_length_limit="33554432"]
+#![type_length_limit="67108864"]
 
 use std::{
     time::Duration,
