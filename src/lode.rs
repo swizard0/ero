@@ -441,8 +441,9 @@ impl<S> StateWantAquireReq<S> {
         -> DoWantAquireReq<FI::Future, S, R>
     where FNI: FnMut(S) -> FI,
           FI: IntoFuture,
+          N: AsRef<str>,
     {
-        debug!("State::WantAquireReq");
+        debug!("State::WantAquireReq | {}", core.params.name.as_ref());
         match core.aquire_rx.poll() {
             Ok(Async::NotReady) =>
                 DoWantAquireReq::NotReady { next_state: self, },
@@ -491,7 +492,7 @@ impl<FUI, R> StateWantInitFn<FUI, R> {
           FCW: IntoFuture,
           N: AsRef<str>,
     {
-        debug!("State::WantInitFn");
+        debug!("State::WantInitFn | {}", core.params.name.as_ref());
         match self.future.poll() {
             Ok(Async::NotReady) =>
                 DoWantInitFn::NotReady { next_state: self, },
@@ -567,8 +568,9 @@ impl<S, R> StateWantInitFnRestart<S, R> {
         -> DoWantInitFnRestart<FI::Future, S, R>
     where FNI: FnMut(S) -> FI,
           FI: IntoFuture,
+          N: AsRef<str>,
     {
-        debug!("State::WantInitFnRestart");
+        debug!("State::WantInitFnRestart | {}", core.params.name.as_ref());
         match self.future.poll() {
             Ok(Async::NotReady) =>
                 DoWantInitFnRestart::NotReady { next_state: self, },
@@ -601,11 +603,12 @@ struct StateWantAquireReqRestart<S> {
 impl<S> StateWantAquireReqRestart<S> {
     fn step<FNI, FNA, FNRM, FNRW, FNCM, FNCW, N, R>(
         mut self,
-        _core: &mut Core<FNI, FNA, FNRM, FNRW, FNCM, FNCW, N, R>,
+        core: &mut Core<FNI, FNA, FNRM, FNRW, FNCM, FNCW, N, R>,
     )
         -> DoWantAquireReqRestart<S>
+    where N: AsRef<str>,
     {
-        debug!("State::WantAquireReqRestart");
+        debug!("State::WantAquireReqRestart | {}", core.params.name.as_ref());
         match self.future.poll() {
             Ok(Async::NotReady) =>
                 DoWantAquireReqRestart::NotReady { next_state: self, },
@@ -645,7 +648,7 @@ impl<FUC, R> StateWantInitFnClose<FUC, R> {
           FUC: Future<Item = S, Error = ()>,
           N: AsRef<str>,
     {
-        debug!("State::WantInitFnClose");
+        debug!("State::WantInitFnClose | {}", core.params.name.as_ref());
         match self.future.poll() {
             Ok(Async::NotReady) =>
                 DoWantInitFnClose::NotReady { next_state: self, },
@@ -702,7 +705,7 @@ impl<FUA, R> StateWantAquireFn<FUA, R> {
           FUA: Future<Item = (R, Resource<P, Q>), Error = ErrorSeverity<S, ()>>,
           N: AsRef<str>,
     {
-        debug!("State::WantAquireFn");
+        debug!("State::WantAquireFn | {}", core.params.name.as_ref());
         match self.future.poll() {
             Ok(Async::NotReady) =>
                 DoWantAquireFn::NotReady { next_state: self, },
@@ -779,8 +782,9 @@ impl<P> StateWantAquireThenRelease<P> {
         -> DoWantAquireThenRelease<FA::Future, R, P>
     where FNA: FnMut(P) -> FA,
           FA: IntoFuture,
+          N: AsRef<str>,
     {
-        debug!("State::WantAquireThenRelease");
+        debug!("State::WantAquireThenRelease | {}", core.params.name.as_ref());
         match core.aquire_rx.poll() {
             Ok(Async::NotReady) =>
                 DoWantAquireThenRelease::NotReady {
@@ -827,8 +831,9 @@ impl<P> StateWantReleaseThenAquire<P> {
            FRM: IntoFuture,
            FNCM: FnMut(P) -> FCM,
            FCM: IntoFuture,
+           N: AsRef<str>,
     {
-        debug!("State::WantReleaseThenAquire");
+        debug!("State::WantReleaseThenAquire | {}", core.params.name.as_ref());
         match core.release_rx.poll() {
             Ok(Async::NotReady) =>
                 DoWantReleaseThenAquire::NotReady {
@@ -910,7 +915,7 @@ impl<FUR> StateWantReleaseFn<FUR> {
     where FUR: Future<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>>,
           N: AsRef<str>,
     {
-        debug!("State::WantReleaseFn ({})", self.source);
+        debug!("State::WantReleaseFn ({}) | {}", core.params.name.as_ref(), self.source);
         match self.future.poll() {
             Ok(Async::NotReady) =>
                 DoWantReleaseFn::NotReady { next_state: self, },
@@ -982,7 +987,7 @@ impl<FUC> StateWantCloseFn<FUC> {
     where FUC: Future<Item = S, Error = ()>,
           N: AsRef<str>,
     {
-        debug!("State::WantCloseFn ({})", self.source);
+        debug!("State::WantCloseFn ({}) | {}", core.params.name.as_ref(), self.source);
         match self.future.poll() {
             Ok(Async::NotReady) =>
                 DoWantCloseFn::NotReady { next_state: self, },
@@ -1037,7 +1042,7 @@ impl<Q> StateWantReleaseReq<Q> {
            FCW: IntoFuture,
            N: AsRef<str>,
     {
-        debug!("State::WantReleaseReq");
+        debug!("State::WantReleaseReq | {}", core.params.name.as_ref());
         if core.aquires_count == 0 {
             info!("{} runs out of resources, performing restart", core.params.name.as_ref());
             return DoWantReleaseReq::Close {
