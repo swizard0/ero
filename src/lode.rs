@@ -1,18 +1,11 @@
 use std::{
     mem,
-    time::{
-        Instant,
-    },
+    time::Instant,
 };
 
 use futures::{
     Poll,
     Async,
-    future::{
-        loop_fn,
-        result,
-        Either,
-    },
     sync::{
         mpsc,
         oneshot,
@@ -138,15 +131,19 @@ where FNI: FnMut(S) -> FI + Send + 'static,
     let (release_tx, release_rx) = mpsc::unbounded();
 
     let task_future = LodeFuture {
-        params,
-        init_fn,
-        aquire_fn,
-        release_main_fn,
-        release_wait_fn,
-        close_main_fn,
-        close_wait_fn,
-        aquire_rx,
-        release_rx,
+        core: Core {
+            params,
+            init_fn,
+            aquire_fn,
+            release_main_fn,
+            release_wait_fn,
+            close_main_fn,
+            close_wait_fn,
+            aquire_rx,
+            release_rx,
+            generation: 0,
+            aquires_count: 0,
+        },
         state: State::WantAquireReq(StateWantAquireReq {
             init_state,
         }),
@@ -157,7 +154,7 @@ where FNI: FnMut(S) -> FI + Send + 'static,
 }
 
 
-struct LodeFuture<FNI, FNA, FNRM, FNRW, FNCM, FNCW, N, S, R, P, Q> {
+struct Core<FNI, FNA, FNRM, FNRW, FNCM, FNCW, N, R> {
     params: Params<N>,
     init_fn: FNI,
     aquire_fn: FNA,
@@ -167,38 +164,44 @@ struct LodeFuture<FNI, FNA, FNRM, FNRW, FNCM, FNCW, N, S, R, P, Q> {
     close_wait_fn: FNCW,
     aquire_rx: AquirePeer<R>,
     release_rx: ReleasePeer<R>,
-    state: State<S, R, P, Q>,
+    generation: Generation,
+    aquires_count: usize,
 }
 
-enum State<S, R, P, Q> {
+struct LodeFuture<FNI, FI, FNA, FA, FNRM, FRM, FNRW, FNCM, FCM, FNCW, FCW, N, S, R, P, Q>
+where FI: IntoFuture,
+      FA: IntoFuture,
+      FRM: IntoFuture,
+      FCM: IntoFuture,
+      FCW: IntoFuture,
+{
+    core: Core<FNI, FNA, FNRM, FNRW, FNCM, FNCW, N, R>,
+    state: State<FI, FA, FRM, FCM, FCW, S, R, P, Q>,
+}
+
+enum State<FI, FA, FRM, FCM, FCW, S, R, P, Q>
+where FI: IntoFuture,
+      FA: IntoFuture,
+      FRM: IntoFuture,
+      FCM: IntoFuture,
+      FCW: IntoFuture,
+{
     Invalid,
     WantAquireReq(StateWantAquireReq<S>),
-    WantInitFn(StateWantInitFn<S, R>),
-    WantAquireFn(StateWantAquireFn<R, P>),
-    WantCloseWaitFn(StateWantCloseWaitFn<R, Q>),
-}
-
-struct StateWantAquireReq<S> {
-    init_state: S,
-}
-
-struct StateWantInitFn<S, R> {
-    init_state: S,
-    aquire_req_pending: AquireReq<R>,
-}
-
-struct StateWantAquireFn<R, P> {
-    aquire_req_pending: AquireReq<R>,
-    state_avail: P,
-}
-
-struct StateWantCloseWaitFn<R, Q> {
-    aquire_req_pending: AquireReq<R>,
-    state_no_left: Q,
+    WantInitFn(StateWantInitFn<FI::Future, R>),
+    WantInitFnRestart(StateWantInitFnRestart<S, R>),
+    WantInitFnClose(StateWantInitFnClose<FCW::Future, R>),
+    WantAquireFn(StateWantAquireFn<FA::Future, R>),
+    WantAquireThenRelease(StateWantAquireThenRelease<P>),
+    WantReleaseThenAquire(StateWantReleaseThenAquire<P>),
+    WantReleaseMainFn(StateWantReleaseMainFn<FRM::Future>),
+    WantCloseMainFn(StateWantCloseMainFn<FCM::Future>),
+    WantReleaseWaitFn(StateWantReleaseWaitFn<Q>),
+    WantCloseWaitFn(StateWantCloseWaitFn<FCW::Future, R>),
 }
 
 impl<FNI, FI, FNA, FA, FNRM, FRM, FNRW, FRW, FNCM, FCM, FNCW, FCW, N, S, R, P, Q> Future
-    for LodeFuture<FNI, FNA, FNRM, FNRW, FNCM, FNCW, N, S, R, P, Q>
+    for LodeFuture<FNI, FI, FNA, FA, FNRM, FRM, FNRW, FNCM, FCM, FNCW, FCW, N, S, R, P, Q>
 where FNI: FnMut(S) -> FI + Send + 'static,
       FI: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>> + 'static,
       FI::Future: Send,
@@ -231,46 +234,567 @@ where FNI: FnMut(S) -> FI + Send + 'static,
             match mem::replace(&mut self.state, State::Invalid) {
                 State::Invalid =>
                     panic!("cannot poll LodeFuture twice"),
-                State::WantAquireReq(StateWantAquireReq { init_state, }) => {
-                    debug!("State::WantAquireReq poll");
-                    match self.aquire_rx.poll() {
-                        Ok(Async::NotReady) => {
-                            self.state = State::WantAquireReq(StateWantAquireReq { init_state, });
+
+                State::WantAquireReq(state) =>
+                    match state.step(&mut self.core) {
+                        DoWantAquireReq::NotReady { next_state, } => {
+                            self.state = State::WantAquireReq(next_state);
                             return Ok(Async::NotReady);
                         },
-                        Ok(Async::Ready(Some(aquire_req_pending))) => {
-                            self.state = State::WantInitFn(StateWantInitFn { init_state, aquire_req_pending, });
-                            continue;
-                        },
-                        Ok(Async::Ready(None)) => {
-                            debug!("aquire channel depleted");
-                            return Ok(Async::Ready(()));
-                        },
-                        Err(()) => {
-                            debug!("aquire channel outer endpoint dropped");
-                            return Ok(Async::Ready(()));
-                        },
-                    }
-                },
-                State::WantInitFn(StateWantInitFn { init_state, aquire_req_pending, }) => {
-                    debug!("State::WantInitFn poll");
+                        DoWantAquireReq::Proceed { next_state, } =>
+                            self.state = State::WantInitFn(next_state),
+                        DoWantAquireReq::Shutdown =>
+                            return Ok(Async::Ready(())),
+                    },
 
-                    unimplemented!()
-                },
-                State::WantAquireFn(StateWantAquireFn { aquire_req_pending, state_avail, }) => {
-                    debug!("State::WantAquireFn poll");
+                State::WantInitFn(state) =>
+                    match state.step(&mut self.core) {
+                        DoWantInitFn::NotReady { next_state, } => {
+                            self.state = State::WantInitFn(next_state);
+                            return Ok(Async::NotReady);
+                        },
+                        DoWantInitFn::Aquire { next_state, } =>
+                            self.state = State::WantAquireFn(next_state),
+                        DoWantInitFn::Close { next_state, } =>
+                            self.state = State::WantInitFnClose(next_state),
+                        DoWantInitFn::RestartNow { next_state, } =>
+                            self.state = State::WantInitFn(next_state),
+                        DoWantInitFn::RestartWait { next_state, } =>
+                            self.state = State::WantInitFnRestart(next_state),
+                        DoWantInitFn::Fatal =>
+                            return Err(()),
+                    },
 
-                    unimplemented!()
-                },
-                State::WantCloseWaitFn(StateWantCloseWaitFn { aquire_req_pending, state_no_left, }) => {
-                    debug!("State::WantCloseWaitFn poll");
+                State::WantInitFnRestart(state) =>
+                    match state.step(&mut self.core) {
+                        DoWantInitFnRestart::NotReady { next_state, } => {
+                            self.state = State::WantInitFnRestart(next_state);
+                            return Ok(Async::NotReady);
+                        },
+                        DoWantInitFnRestart::ItIsTime { next_state, } =>
+                            self.state = State::WantInitFn(next_state),
+                        DoWantInitFnRestart::Fatal =>
+                            return Err(()),
+                    },
 
-                    unimplemented!()
-                },
+                State::WantInitFnClose(state) =>
+                    match state.step(&mut self.core) {
+                        DoWantInitFnClose::NotReady { next_state, } => {
+                            self.state = State::WantInitFnClose(next_state);
+                            return Ok(Async::NotReady);
+                        },
+                        DoWantInitFnClose::RestartNow { next_state, } =>
+                            self.state = State::WantInitFn(next_state),
+                        DoWantInitFnClose::RestartWait { next_state, } =>
+                            self.state = State::WantInitFnRestart(next_state),
+                        DoWantInitFnClose::Fatal =>
+                            return Err(()),
+                    },
+
+                State::WantAquireFn(state) =>
+                    match state.step(&mut self.core) {
+                        DoWantAquireFn::NotReady { next_state, } => {
+                            self.state = State::WantAquireFn(next_state);
+                            return Ok(Async::NotReady);
+                        },
+                        DoWantAquireFn::Available { next_state, } =>
+                            self.state = State::WantAquireThenRelease(next_state),
+                        DoWantAquireFn::OutOfStock { next_state, } =>
+                            self.state = State::WantReleaseWaitFn(next_state),
+                        DoWantAquireFn::RestartNow { next_state, } =>
+                            self.state = State::WantInitFn(next_state),
+                        DoWantAquireFn::RestartWait { next_state, } =>
+                            self.state = State::WantInitFnRestart(next_state),
+                        DoWantAquireFn::Fatal =>
+                            return Err(()),
+                    },
+
+                State::WantAquireThenRelease(state) =>
+                    match state.step(&mut self.core) {
+                        DoWantAquireThenRelease::NotReady { next_state, } =>
+                            self.state = State::WantReleaseThenAquire(next_state),
+                        DoWantAquireThenRelease::Aquire { next_state, } =>
+                            self.state = State::WantAquireFn(next_state),
+                        DoWantAquireThenRelease::Shutdown =>
+                            return Ok(Async::Ready(())),
+                    },
+
+                State::WantReleaseThenAquire(state) =>
+                    match state.step(&mut self.core) {
+                        DoWantReleaseThenAquire::NotReady { next_state, } => {
+                            self.state = State::WantAquireThenRelease(next_state);
+                            return Ok(Async::NotReady);
+                        },
+                        DoWantReleaseThenAquire::Release { next_state, } =>
+                            self.state = State::WantReleaseMainFn(next_state),
+                        DoWantReleaseThenAquire::Close { next_state, } =>
+                            self.state = State::WantCloseMainFn(next_state),
+                        DoWantReleaseThenAquire::TryAgain { next_state, } =>
+                            self.state = State::WantReleaseThenAquire(next_state),
+                        DoWantReleaseThenAquire::Shutdown =>
+                            return Ok(Async::Ready(())),
+                    },
+
+                State::WantReleaseMainFn(state) =>
+                    unimplemented!(),
+
+                State::WantCloseMainFn(state) =>
+                    unimplemented!(),
+
+                State::WantReleaseWaitFn(state) =>
+                    unimplemented!(),
+
+                State::WantCloseWaitFn(state) =>
+                    unimplemented!(),
             }
         }
     }
 }
+
+struct StateWantAquireReq<S> {
+    init_state: S,
+}
+
+impl<S> StateWantAquireReq<S> {
+    fn step<FNI, FI, FNA, FNRM, FNRW, FNCM, FNCW, N, R>(
+        self,
+        core: &mut Core<FNI, FNA, FNRM, FNRW, FNCM, FNCW, N, R>,
+    )
+        -> DoWantAquireReq<FI::Future, S, R>
+    where FNI: FnMut(S) -> FI,
+          FI: IntoFuture,
+    {
+        debug!("State::WantAquireReq");
+        match core.aquire_rx.poll() {
+            Ok(Async::NotReady) =>
+                DoWantAquireReq::NotReady { next_state: self, },
+            Ok(Async::Ready(Some(aquire_req_pending))) =>
+                DoWantAquireReq::Proceed {
+                    next_state: StateWantInitFn {
+                        future: (core.init_fn)(self.init_state).into_future(),
+                        aquire_req_pending,
+                    },
+                },
+            Ok(Async::Ready(None)) => {
+                debug!("aquire channel depleted");
+                DoWantAquireReq::Shutdown
+            },
+            Err(()) => {
+                debug!("aquire channel outer endpoint dropped");
+                DoWantAquireReq::Shutdown
+            },
+        }
+    }
+}
+
+enum DoWantAquireReq<FUI, S, R> {
+    NotReady { next_state: StateWantAquireReq<S>, },
+    Proceed { next_state: StateWantInitFn<FUI, R>, },
+    Shutdown,
+}
+
+struct StateWantInitFn<FUI, R> {
+    future: FUI,
+    aquire_req_pending: AquireReq<R>,
+}
+
+impl<FUI, R> StateWantInitFn<FUI, R> {
+    fn step<FNI, FI, FNA, FA, FNRM, FNRW, FNCM, FNCW, FCW, N, S, P, Q>(
+        mut self,
+        core: &mut Core<FNI, FNA, FNRM, FNRW, FNCM, FNCW, N, R>,
+    )
+        -> DoWantInitFn<FUI, FA::Future, FCW::Future, S, R>
+    where FNI: FnMut(S) -> FI,
+          FI: IntoFuture<Future = FUI, Item = FUI::Item, Error = FUI::Error>,
+          FUI: Future<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>>,
+          FNA: FnMut(P) -> FA,
+          FA: IntoFuture,
+          FNCW: FnMut(Q) -> FCW,
+          FCW: IntoFuture,
+          N: AsRef<str>,
+    {
+        debug!("State::WantInitFn");
+        match self.future.poll() {
+            Ok(Async::NotReady) =>
+                DoWantInitFn::NotReady { next_state: self, },
+            Ok(Async::Ready(Resource::Available(state_avail))) => {
+                core.generation += 1;
+                core.aquires_count = 0;
+                DoWantInitFn::Aquire {
+                    next_state: StateWantAquireFn {
+                        future: (core.aquire_fn)(state_avail).into_future(),
+                        aquire_req_pending: self.aquire_req_pending,
+                    },
+                }
+            },
+            Ok(Async::Ready(Resource::OutOfStock(state_no_left))) => {
+                warn!("init_fn gives no resource in {}", core.params.name.as_ref());
+                DoWantInitFn::Close {
+                    next_state: StateWantInitFnClose {
+                        future: (core.close_wait_fn)(state_no_left).into_future(),
+                        aquire_req_pending: self.aquire_req_pending,
+                    },
+                }
+            },
+            Err(ErrorSeverity::Recoverable { state, }) =>
+                match core.params.restart_strategy {
+                    RestartStrategy::RestartImmediately => {
+                        info!("init_fn failed: restarting {} immediately", core.params.name.as_ref());
+                        DoWantInitFn::RestartNow {
+                            next_state: StateWantInitFn {
+                                future: (core.init_fn)(state).into_future(),
+                                aquire_req_pending: self.aquire_req_pending,
+                            },
+                        }
+                    },
+                    RestartStrategy::Delay { restart_after, } => {
+                        info!("init_fn failed: restarting {} in {:?}", core.params.name.as_ref(), restart_after);
+                        DoWantInitFn::RestartWait {
+                            next_state: StateWantInitFnRestart {
+                                future: Delay::new(Instant::now() + restart_after),
+                                init_state: state,
+                                aquire_req_pending: self.aquire_req_pending,
+                            },
+                        }
+                    },
+                }
+            Err(ErrorSeverity::Fatal(())) => {
+                error!("init_fn {} crashed with fatal error, terminating", core.params.name.as_ref());
+                DoWantInitFn::Fatal
+            },
+        }
+    }
+}
+
+enum DoWantInitFn<FUI, FUA, FUC, S, R> {
+    NotReady { next_state: StateWantInitFn<FUI, R>, },
+    Aquire { next_state: StateWantAquireFn<FUA, R>, },
+    Close { next_state: StateWantInitFnClose<FUC, R>, },
+    RestartNow { next_state: StateWantInitFn<FUI, R>, },
+    RestartWait { next_state: StateWantInitFnRestart<S, R>, },
+    Fatal,
+}
+
+struct StateWantInitFnRestart<S, R> {
+    future: Delay,
+    init_state: S,
+    aquire_req_pending: AquireReq<R>,
+}
+
+impl<S, R> StateWantInitFnRestart<S, R> {
+    fn step<FNI, FI, FNA, FNRM, FNRW, FNCM, FNCW, N>(
+        mut self,
+        core: &mut Core<FNI, FNA, FNRM, FNRW, FNCM, FNCW, N, R>,
+    )
+        -> DoWantInitFnRestart<FI::Future, S, R>
+    where FNI: FnMut(S) -> FI,
+          FI: IntoFuture,
+    {
+        debug!("State::WantInitFnRestart");
+        match self.future.poll() {
+            Ok(Async::NotReady) =>
+                DoWantInitFnRestart::NotReady { next_state: self, },
+            Ok(Async::Ready(())) =>
+                DoWantInitFnRestart::ItIsTime {
+                    next_state: StateWantInitFn {
+                        future: (core.init_fn)(self.init_state).into_future(),
+                        aquire_req_pending: self.aquire_req_pending,
+                    },
+                },
+            Err(error) => {
+                error!("timer future crashed with fatal error: {:?}, terminating", error);
+                DoWantInitFnRestart::Fatal
+            },
+        }
+    }
+}
+
+enum DoWantInitFnRestart<FUI, S, R> {
+    NotReady { next_state: StateWantInitFnRestart<S, R>, },
+    ItIsTime { next_state: StateWantInitFn<FUI, R>, },
+    Fatal,
+}
+
+struct StateWantInitFnClose<FUC, R> {
+    future: FUC,
+    aquire_req_pending: AquireReq<R>,
+}
+
+impl<FUC, R> StateWantInitFnClose<FUC, R> {
+    fn step<FNI, FI, FNA, FNRM, FNRW, FNCM, FNCW, N, S>(
+        mut self,
+        core: &mut Core<FNI, FNA, FNRM, FNRW, FNCM, FNCW, N, R>,
+    )
+        -> DoWantInitFnClose<FUC, FI::Future, S, R>
+    where FNI: FnMut(S) -> FI,
+          FI: IntoFuture,
+          FUC: Future<Item = S, Error = ()>,
+          N: AsRef<str>,
+    {
+        debug!("State::WantInitFnClose");
+        match self.future.poll() {
+            Ok(Async::NotReady) =>
+                DoWantInitFnClose::NotReady { next_state: self, },
+            Ok(Async::Ready(state)) =>
+                match core.params.restart_strategy {
+                    RestartStrategy::RestartImmediately => {
+                        info!("restarting {} immediately after close", core.params.name.as_ref());
+                        DoWantInitFnClose::RestartNow {
+                            next_state: StateWantInitFn {
+                                future: (core.init_fn)(state).into_future(),
+                                aquire_req_pending: self.aquire_req_pending,
+                            },
+                        }
+                    },
+                    RestartStrategy::Delay { restart_after, } => {
+                        info!("restarting {} in {:?} after close", core.params.name.as_ref(), restart_after);
+                        DoWantInitFnClose::RestartWait {
+                            next_state: StateWantInitFnRestart {
+                                future: Delay::new(Instant::now() + restart_after),
+                                init_state: state,
+                                aquire_req_pending: self.aquire_req_pending,
+                            },
+                        }
+                    },
+                }
+            Err(()) => {
+                error!("close_wait_fn crashed with fatal error, terminating");
+                DoWantInitFnClose::Fatal
+            },
+        }
+    }
+}
+
+enum DoWantInitFnClose<FUC, FUI, S, R> {
+    NotReady { next_state: StateWantInitFnClose<FUC, R>, },
+    RestartNow { next_state: StateWantInitFn<FUI, R>, },
+    RestartWait { next_state: StateWantInitFnRestart<S, R>, },
+    Fatal,
+}
+
+struct StateWantAquireFn<FUA, R> {
+    future: FUA,
+    aquire_req_pending: AquireReq<R>,
+}
+
+impl<FUA, R> StateWantAquireFn<FUA, R> {
+    fn step<FNI, FI, FNA, FNRM, FNRW, FNCM, FNCW, N, S, P, Q>(
+        mut self,
+        core: &mut Core<FNI, FNA, FNRM, FNRW, FNCM, FNCW, N, R>,
+    )
+        -> DoWantAquireFn<FUA, FI::Future, S, R, P, Q>
+    where FNI: FnMut(S) -> FI,
+          FI: IntoFuture,
+          FUA: Future<Item = (R, Resource<P, Q>), Error = ErrorSeverity<S, ()>>,
+          N: AsRef<str>,
+    {
+        debug!("State::WantAquireFn");
+        match self.future.poll() {
+            Ok(Async::NotReady) =>
+                DoWantAquireFn::NotReady { next_state: self, },
+            Ok(Async::Ready((resource, resource_status))) => {
+                match self.aquire_req_pending.reply_tx.send(ResourceGen { resource, generation: core.generation, }) {
+                    Ok(()) =>
+                        core.aquires_count += 1,
+                    Err(_resource) =>
+                        warn!("receiver has been dropped before resource is aquired"),
+                };
+                match resource_status {
+                    Resource::Available(state_avail) =>
+                        DoWantAquireFn::Available {
+                            next_state: StateWantAquireThenRelease {
+                                state_avail,
+                            },
+                        },
+                    Resource::OutOfStock(state_no_left) =>
+                        DoWantAquireFn::OutOfStock {
+                            next_state: StateWantReleaseWaitFn {
+                                state_no_left,
+                            },
+                        },
+                }
+            },
+            Err(ErrorSeverity::Recoverable { state, }) =>
+                match core.params.restart_strategy {
+                    RestartStrategy::RestartImmediately => {
+                        info!("aquire_fn failed: restarting {} immediately", core.params.name.as_ref());
+                        DoWantAquireFn::RestartNow {
+                            next_state: StateWantInitFn {
+                                future: (core.init_fn)(state).into_future(),
+                                aquire_req_pending: self.aquire_req_pending,
+                            },
+                        }
+                    },
+                    RestartStrategy::Delay { restart_after, } => {
+                        info!("aquire_fn failed: restarting {} in {:?}", core.params.name.as_ref(), restart_after);
+                        DoWantAquireFn::RestartWait {
+                            next_state: StateWantInitFnRestart {
+                                future: Delay::new(Instant::now() + restart_after),
+                                init_state: state,
+                                aquire_req_pending: self.aquire_req_pending,
+                            },
+                        }
+                    },
+                }
+            Err(ErrorSeverity::Fatal(())) => {
+                error!("aquire_fn {} crashed with fatal error, terminating", core.params.name.as_ref());
+                DoWantAquireFn::Fatal
+            },
+        }
+    }
+}
+
+enum DoWantAquireFn<FUA, FUI, S, R, P, Q> {
+    NotReady { next_state: StateWantAquireFn<FUA, R>, },
+    Available { next_state: StateWantAquireThenRelease<P>, },
+    OutOfStock { next_state: StateWantReleaseWaitFn<Q>, },
+    RestartNow { next_state: StateWantInitFn<FUI, R>, },
+    RestartWait { next_state: StateWantInitFnRestart<S, R>, },
+    Fatal,
+}
+
+struct StateWantAquireThenRelease<P> {
+    state_avail: P,
+}
+
+impl<P> StateWantAquireThenRelease<P> {
+    fn step<FNI, FNA, FA, FNRM, FNRW, FNCM, FNCW, N, R>(
+        mut self,
+        core: &mut Core<FNI, FNA, FNRM, FNRW, FNCM, FNCW, N, R>,
+    )
+        -> DoWantAquireThenRelease<FA::Future, R, P>
+    where FNA: FnMut(P) -> FA,
+          FA: IntoFuture,
+    {
+        debug!("State::WantAquireThenRelease");
+        match core.aquire_rx.poll() {
+            Ok(Async::NotReady) =>
+                DoWantAquireThenRelease::NotReady {
+                    next_state: StateWantReleaseThenAquire {
+                        state_avail: self.state_avail,
+                    },
+                },
+            Ok(Async::Ready(Some(aquire_req_pending))) =>
+                DoWantAquireThenRelease::Aquire {
+                    next_state: StateWantAquireFn {
+                        future: (core.aquire_fn)(self.state_avail).into_future(),
+                        aquire_req_pending: aquire_req_pending,
+                    },
+                },
+            Ok(Async::Ready(None)) => {
+                debug!("aquire channel depleted");
+                DoWantAquireThenRelease::Shutdown
+            },
+            Err(()) => {
+                debug!("aquire channel outer endpoint dropped");
+                DoWantAquireThenRelease::Shutdown
+            },
+        }
+    }
+}
+
+enum DoWantAquireThenRelease<FUA, R, P> {
+    NotReady { next_state: StateWantReleaseThenAquire<P>, },
+    Aquire { next_state: StateWantAquireFn<FUA, R>, },
+    Shutdown,
+}
+
+struct StateWantReleaseThenAquire<P> {
+    state_avail: P,
+}
+
+impl<P> StateWantReleaseThenAquire<P> {
+    fn step<FNI, FNA, FNRM, FRM, FNRW, FNCM, FCM, FNCW, N, R>(
+        mut self,
+        core: &mut Core<FNI, FNA, FNRM, FNRW, FNCM, FNCW, N, R>,
+    )
+        -> DoWantReleaseThenAquire<FRM::Future, FCM::Future, P>
+    where  FNRM: FnMut(P, Option<R>) -> FRM,
+           FRM: IntoFuture,
+           FNCM: FnMut(P) -> FCM,
+           FCM: IntoFuture,
+    {
+        debug!("State::WantReleaseThenAquire");
+        match core.release_rx.poll() {
+            Ok(Async::NotReady) =>
+                DoWantReleaseThenAquire::NotReady {
+                    next_state: StateWantAquireThenRelease {
+                        state_avail: self.state_avail,
+                    },
+                },
+            Ok(Async::Ready(Some(release_req))) =>
+                if release_req.generation == core.generation {
+                    match release_req.status {
+                        ResourceStatus::Reimburse(resource) => {
+                            debug!("release request (resource reimbursed)");
+                            DoWantReleaseThenAquire::Release {
+                                next_state: StateWantReleaseMainFn {
+                                    future: (core.release_main_fn)(self.state_avail, Some(resource)).into_future(),
+                                },
+                            }
+                        },
+                        ResourceStatus::ResourceLost => {
+                            debug!("release request (resource lost)");
+                            DoWantReleaseThenAquire::Release {
+                                next_state: StateWantReleaseMainFn {
+                                    future: (core.release_main_fn)(self.state_avail, None).into_future(),
+                                },
+                            }
+                        },
+                        ResourceStatus::ResourceFault => {
+                            warn!("resource fault report: performing restart");
+                            DoWantReleaseThenAquire::Close {
+                                next_state: StateWantCloseMainFn {
+                                    future: (core.close_main_fn)(self.state_avail).into_future(),
+                                },
+                            }
+                        },
+                    }
+                } else {
+                    debug!(
+                        "skipping release request for obsolete resource (generation {} while currently is {})",
+                        release_req.generation,
+                        core.generation,
+                    );
+                    DoWantReleaseThenAquire::TryAgain { next_state: self, }
+                },
+            Ok(Async::Ready(None)) => {
+                debug!("release channel depleted");
+                DoWantReleaseThenAquire::Shutdown
+            },
+            Err(()) => {
+                debug!("release channel outer endpoint dropped");
+                DoWantReleaseThenAquire::Shutdown
+            },
+        }
+    }
+}
+
+enum DoWantReleaseThenAquire<FURM, FUCM, P> {
+    NotReady { next_state: StateWantAquireThenRelease<P>, },
+    Release { next_state: StateWantReleaseMainFn<FURM>, },
+    Close { next_state: StateWantCloseMainFn<FUCM>, },
+    TryAgain { next_state: StateWantReleaseThenAquire<P>, },
+    Shutdown,
+}
+
+struct StateWantReleaseMainFn<FURM> {
+    future: FURM,
+}
+
+struct StateWantCloseMainFn<FUCM> {
+    future: FUCM,
+}
+
+struct StateWantReleaseWaitFn<Q> {
+    state_no_left: Q,
+}
+
+struct StateWantCloseWaitFn<FCW, R> {
+    future: FCW,
+    aquire_req_pending: AquireReq<R>,
+}
+
 
 // pub fn spawn_link<FNI, FI, FNA, FA, FNRM, FRM, FNRW, FRW, FNCM, FCM, FNCW, FCW, N, S, R, P, Q>(
 //     supervisor: &Supervisor,
