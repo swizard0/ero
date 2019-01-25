@@ -10,6 +10,7 @@ use futures::{
         mpsc,
         oneshot,
     },
+    future::loop_fn,
     Sink,
     Future,
     Stream,
@@ -30,19 +31,12 @@ use super::{
     Params,
     ErrorSeverity,
     RestartStrategy,
-    blend::{
-        Gone,
-        Blender,
-        Decompose,
-        ErrorEvent,
-        DecomposeZip,
-    },
     supervisor::Supervisor,
 };
 
-// pub mod uniq;
-// pub mod shared;
-// pub mod stream;
+pub mod uniq;
+pub mod shared;
+pub mod stream;
 
 #[cfg(test)]
 mod tests;
@@ -168,21 +162,23 @@ struct Core<FNI, FNA, FNRM, FNRW, FNCM, FNCW, N, R> {
     aquires_count: usize,
 }
 
-struct LodeFuture<FNI, FI, FNA, FA, FNRM, FRM, FNRW, FNCM, FCM, FNCW, FCW, N, S, R, P, Q>
+struct LodeFuture<FNI, FI, FNA, FA, FNRM, FRM, FNRW, FRW, FNCM, FCM, FNCW, FCW, N, S, R, P, Q>
 where FI: IntoFuture,
       FA: IntoFuture,
       FRM: IntoFuture,
+      FRW: IntoFuture,
       FCM: IntoFuture,
       FCW: IntoFuture,
 {
     core: Core<FNI, FNA, FNRM, FNRW, FNCM, FNCW, N, R>,
-    state: State<FI, FA, FRM, FCM, FCW, S, R, P, Q>,
+    state: State<FI, FA, FRM, FRW, FCM, FCW, S, R, P, Q>,
 }
 
-enum State<FI, FA, FRM, FCM, FCW, S, R, P, Q>
+enum State<FI, FA, FRM, FRW, FCM, FCW, S, R, P, Q>
 where FI: IntoFuture,
       FA: IntoFuture,
       FRM: IntoFuture,
+      FRW: IntoFuture,
       FCM: IntoFuture,
       FCW: IntoFuture,
 {
@@ -190,18 +186,20 @@ where FI: IntoFuture,
     WantAquireReq(StateWantAquireReq<S>),
     WantInitFn(StateWantInitFn<FI::Future, R>),
     WantInitFnRestart(StateWantInitFnRestart<S, R>),
+    WantAquireReqRestart(StateWantAquireReqRestart<S>),
     WantInitFnClose(StateWantInitFnClose<FCW::Future, R>),
     WantAquireFn(StateWantAquireFn<FA::Future, R>),
     WantAquireThenRelease(StateWantAquireThenRelease<P>),
     WantReleaseThenAquire(StateWantReleaseThenAquire<P>),
-    WantReleaseMainFn(StateWantReleaseMainFn<FRM::Future>),
-    WantCloseMainFn(StateWantCloseMainFn<FCM::Future>),
-    WantReleaseWaitFn(StateWantReleaseWaitFn<Q>),
-    WantCloseWaitFn(StateWantCloseWaitFn<FCW::Future, R>),
+    WantReleaseMainFn(StateWantReleaseFn<FRM::Future>),
+    WantCloseMainFn(StateWantCloseFn<FCM::Future>),
+    WantReleaseReq(StateWantReleaseReq<Q>),
+    WantReleaseWaitFn(StateWantReleaseFn<FRW::Future>),
+    WantCloseWaitFn(StateWantCloseFn<FCW::Future>),
 }
 
 impl<FNI, FI, FNA, FA, FNRM, FRM, FNRW, FRW, FNCM, FCM, FNCW, FCW, N, S, R, P, Q> Future
-    for LodeFuture<FNI, FI, FNA, FA, FNRM, FRM, FNRW, FNCM, FCM, FNCW, FCW, N, S, R, P, Q>
+    for LodeFuture<FNI, FI, FNA, FA, FNRM, FRM, FNRW, FRW, FNCM, FCM, FNCW, FCW, N, S, R, P, Q>
 where FNI: FnMut(S) -> FI + Send + 'static,
       FI: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>> + 'static,
       FI::Future: Send,
@@ -277,6 +275,18 @@ where FNI: FnMut(S) -> FI + Send + 'static,
                             return Err(()),
                     },
 
+                State::WantAquireReqRestart(state) =>
+                    match state.step(&mut self.core) {
+                        DoWantAquireReqRestart::NotReady { next_state, } => {
+                            self.state = State::WantAquireReqRestart(next_state);
+                            return Ok(Async::NotReady);
+                        },
+                        DoWantAquireReqRestart::ItIsTime { next_state, } =>
+                            self.state = State::WantAquireReq(next_state),
+                        DoWantAquireReqRestart::Fatal =>
+                            return Err(()),
+                    },
+
                 State::WantInitFnClose(state) =>
                     match state.step(&mut self.core) {
                         DoWantInitFnClose::NotReady { next_state, } => {
@@ -300,7 +310,7 @@ where FNI: FnMut(S) -> FI + Send + 'static,
                         DoWantAquireFn::Available { next_state, } =>
                             self.state = State::WantAquireThenRelease(next_state),
                         DoWantAquireFn::OutOfStock { next_state, } =>
-                            self.state = State::WantReleaseWaitFn(next_state),
+                            self.state = State::WantReleaseReq(next_state),
                         DoWantAquireFn::RestartNow { next_state, } =>
                             self.state = State::WantInitFn(next_state),
                         DoWantAquireFn::RestartWait { next_state, } =>
@@ -336,16 +346,84 @@ where FNI: FnMut(S) -> FI + Send + 'static,
                     },
 
                 State::WantReleaseMainFn(state) =>
-                    unimplemented!(),
+                    match state.step(&mut self.core) {
+                        DoWantReleaseFn::NotReady { next_state, } => {
+                            self.state = State::WantReleaseMainFn(next_state);
+                            return Ok(Async::NotReady);
+                        },
+                        DoWantReleaseFn::Available { next_state, } =>
+                            self.state = State::WantReleaseThenAquire(next_state),
+                        DoWantReleaseFn::OutOfStock { next_state, } =>
+                            self.state = State::WantReleaseReq(next_state),
+                        DoWantReleaseFn::RestartNow { next_state, } =>
+                            self.state = State::WantAquireReq(next_state),
+                        DoWantReleaseFn::RestartWait { next_state, } =>
+                            self.state = State::WantAquireReqRestart(next_state),
+                        DoWantReleaseFn::Fatal =>
+                            return Err(()),
+                    },
 
                 State::WantCloseMainFn(state) =>
-                    unimplemented!(),
+                    match state.step(&mut self.core) {
+                        DoWantCloseFn::NotReady { next_state, } => {
+                            self.state = State::WantCloseMainFn(next_state);
+                            return Ok(Async::NotReady);
+                        },
+                        DoWantCloseFn::RestartNow { next_state, } =>
+                            self.state = State::WantAquireReq(next_state),
+                        DoWantCloseFn::RestartWait { next_state, } =>
+                            self.state = State::WantAquireReqRestart(next_state),
+                        DoWantCloseFn::Fatal =>
+                            return Err(()),
+                    },
+
+                State::WantReleaseReq(state) =>
+                    match state.step(&mut self.core) {
+                        DoWantReleaseReq::NotReady { next_state, } => {
+                            self.state = State::WantReleaseReq(next_state);
+                            return Ok(Async::NotReady);
+                        },
+                        DoWantReleaseReq::Release { next_state, } =>
+                            self.state = State::WantReleaseWaitFn(next_state),
+                        DoWantReleaseReq::Close { next_state, } =>
+                            self.state = State::WantCloseWaitFn(next_state),
+                        DoWantReleaseReq::TryAgain { next_state, } =>
+                            self.state = State::WantReleaseReq(next_state),
+                        DoWantReleaseReq::Shutdown =>
+                            return Ok(Async::Ready(())),
+                    },
 
                 State::WantReleaseWaitFn(state) =>
-                    unimplemented!(),
+                    match state.step(&mut self.core) {
+                        DoWantReleaseFn::NotReady { next_state, } => {
+                            self.state = State::WantReleaseWaitFn(next_state);
+                            return Ok(Async::NotReady);
+                        },
+                        DoWantReleaseFn::Available { next_state, } =>
+                            self.state = State::WantReleaseThenAquire(next_state),
+                        DoWantReleaseFn::OutOfStock { next_state, } =>
+                            self.state = State::WantReleaseReq(next_state),
+                        DoWantReleaseFn::RestartNow { next_state, } =>
+                            self.state = State::WantAquireReq(next_state),
+                        DoWantReleaseFn::RestartWait { next_state, } =>
+                            self.state = State::WantAquireReqRestart(next_state),
+                        DoWantReleaseFn::Fatal =>
+                            return Err(()),
+                    },
 
                 State::WantCloseWaitFn(state) =>
-                    unimplemented!(),
+                    match state.step(&mut self.core) {
+                        DoWantCloseFn::NotReady { next_state, } => {
+                            self.state = State::WantCloseWaitFn(next_state);
+                            return Ok(Async::NotReady);
+                        },
+                        DoWantCloseFn::RestartNow { next_state, } =>
+                            self.state = State::WantAquireReq(next_state),
+                        DoWantCloseFn::RestartWait { next_state, } =>
+                            self.state = State::WantAquireReqRestart(next_state),
+                        DoWantCloseFn::Fatal =>
+                            return Err(()),
+                    },
             }
         }
     }
@@ -515,6 +593,42 @@ enum DoWantInitFnRestart<FUI, S, R> {
     Fatal,
 }
 
+struct StateWantAquireReqRestart<S> {
+    future: Delay,
+    init_state: S,
+}
+
+impl<S> StateWantAquireReqRestart<S> {
+    fn step<FNI, FNA, FNRM, FNRW, FNCM, FNCW, N, R>(
+        mut self,
+        _core: &mut Core<FNI, FNA, FNRM, FNRW, FNCM, FNCW, N, R>,
+    )
+        -> DoWantAquireReqRestart<S>
+    {
+        debug!("State::WantAquireReqRestart");
+        match self.future.poll() {
+            Ok(Async::NotReady) =>
+                DoWantAquireReqRestart::NotReady { next_state: self, },
+            Ok(Async::Ready(())) =>
+                DoWantAquireReqRestart::ItIsTime {
+                    next_state: StateWantAquireReq {
+                        init_state: self.init_state,
+                    },
+                },
+            Err(error) => {
+                error!("timer future crashed with fatal error: {:?}, terminating", error);
+                DoWantAquireReqRestart::Fatal
+            },
+        }
+    }
+}
+
+enum DoWantAquireReqRestart<S> {
+    NotReady { next_state: StateWantAquireReqRestart<S>, },
+    ItIsTime { next_state: StateWantAquireReq<S>, },
+    Fatal,
+}
+
 struct StateWantInitFnClose<FUC, R> {
     future: FUC,
     aquire_req_pending: AquireReq<R>,
@@ -538,7 +652,7 @@ impl<FUC, R> StateWantInitFnClose<FUC, R> {
             Ok(Async::Ready(state)) =>
                 match core.params.restart_strategy {
                     RestartStrategy::RestartImmediately => {
-                        info!("restarting {} immediately after close", core.params.name.as_ref());
+                        info!("restarting {} immediately after close_wait_fn", core.params.name.as_ref());
                         DoWantInitFnClose::RestartNow {
                             next_state: StateWantInitFn {
                                 future: (core.init_fn)(state).into_future(),
@@ -547,7 +661,7 @@ impl<FUC, R> StateWantInitFnClose<FUC, R> {
                         }
                     },
                     RestartStrategy::Delay { restart_after, } => {
-                        info!("restarting {} in {:?} after close", core.params.name.as_ref(), restart_after);
+                        info!("restarting {} in {:?} after close_wait_fn", core.params.name.as_ref(), restart_after);
                         DoWantInitFnClose::RestartWait {
                             next_state: StateWantInitFnRestart {
                                 future: Delay::new(Instant::now() + restart_after),
@@ -608,7 +722,7 @@ impl<FUA, R> StateWantAquireFn<FUA, R> {
                         },
                     Resource::OutOfStock(state_no_left) =>
                         DoWantAquireFn::OutOfStock {
-                            next_state: StateWantReleaseWaitFn {
+                            next_state: StateWantReleaseReq {
                                 state_no_left,
                             },
                         },
@@ -647,7 +761,7 @@ impl<FUA, R> StateWantAquireFn<FUA, R> {
 enum DoWantAquireFn<FUA, FUI, S, R, P, Q> {
     NotReady { next_state: StateWantAquireFn<FUA, R>, },
     Available { next_state: StateWantAquireThenRelease<P>, },
-    OutOfStock { next_state: StateWantReleaseWaitFn<Q>, },
+    OutOfStock { next_state: StateWantReleaseReq<Q>, },
     RestartNow { next_state: StateWantInitFn<FUI, R>, },
     RestartWait { next_state: StateWantInitFnRestart<S, R>, },
     Fatal,
@@ -659,7 +773,7 @@ struct StateWantAquireThenRelease<P> {
 
 impl<P> StateWantAquireThenRelease<P> {
     fn step<FNI, FNA, FA, FNRM, FNRW, FNCM, FNCW, N, R>(
-        mut self,
+        self,
         core: &mut Core<FNI, FNA, FNRM, FNRW, FNCM, FNCW, N, R>,
     )
         -> DoWantAquireThenRelease<FA::Future, R, P>
@@ -705,7 +819,7 @@ struct StateWantReleaseThenAquire<P> {
 
 impl<P> StateWantReleaseThenAquire<P> {
     fn step<FNI, FNA, FNRM, FRM, FNRW, FNCM, FCM, FNCW, N, R>(
-        mut self,
+        self,
         core: &mut Core<FNI, FNA, FNRM, FNRW, FNCM, FNCW, N, R>,
     )
         -> DoWantReleaseThenAquire<FRM::Future, FCM::Future, P>
@@ -728,24 +842,28 @@ impl<P> StateWantReleaseThenAquire<P> {
                         ResourceStatus::Reimburse(resource) => {
                             debug!("release request (resource reimbursed)");
                             DoWantReleaseThenAquire::Release {
-                                next_state: StateWantReleaseMainFn {
+                                next_state: StateWantReleaseFn {
                                     future: (core.release_main_fn)(self.state_avail, Some(resource)).into_future(),
+                                    source: "release_main_fn",
                                 },
                             }
                         },
                         ResourceStatus::ResourceLost => {
                             debug!("release request (resource lost)");
                             DoWantReleaseThenAquire::Release {
-                                next_state: StateWantReleaseMainFn {
+                                next_state: StateWantReleaseFn {
                                     future: (core.release_main_fn)(self.state_avail, None).into_future(),
+                                    source: "release_main_fn",
                                 },
                             }
                         },
                         ResourceStatus::ResourceFault => {
                             warn!("resource fault report: performing restart");
                             DoWantReleaseThenAquire::Close {
-                                next_state: StateWantCloseMainFn {
+                                next_state: StateWantCloseFn {
                                     future: (core.close_main_fn)(self.state_avail).into_future(),
+                                    source: "close_main_fn",
+                                    force_immediately: false,
                                 },
                             }
                         },
@@ -772,871 +890,382 @@ impl<P> StateWantReleaseThenAquire<P> {
 
 enum DoWantReleaseThenAquire<FURM, FUCM, P> {
     NotReady { next_state: StateWantAquireThenRelease<P>, },
-    Release { next_state: StateWantReleaseMainFn<FURM>, },
-    Close { next_state: StateWantCloseMainFn<FUCM>, },
+    Release { next_state: StateWantReleaseFn<FURM>, },
+    Close { next_state: StateWantCloseFn<FUCM>, },
     TryAgain { next_state: StateWantReleaseThenAquire<P>, },
     Shutdown,
 }
 
-struct StateWantReleaseMainFn<FURM> {
-    future: FURM,
+struct StateWantReleaseFn<FUR> {
+    future: FUR,
+    source: &'static str,
 }
 
-struct StateWantCloseMainFn<FUCM> {
-    future: FUCM,
+impl<FUR> StateWantReleaseFn<FUR> {
+    fn step<FNI, FNA, FNRM, FNRW, FNCM, FNCW, N, S, R, P, Q>(
+        mut self,
+        core: &mut Core<FNI, FNA, FNRM, FNRW, FNCM, FNCW, N, R>,
+    )
+        -> DoWantReleaseFn<FUR, S, P, Q>
+    where FUR: Future<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>>,
+          N: AsRef<str>,
+    {
+        debug!("State::WantReleaseFn ({})", self.source);
+        match self.future.poll() {
+            Ok(Async::NotReady) =>
+                DoWantReleaseFn::NotReady { next_state: self, },
+            Ok(Async::Ready(Resource::Available(state_avail))) => {
+                core.aquires_count = core.aquires_count.saturating_sub(1);
+                DoWantReleaseFn::Available {
+                    next_state: StateWantReleaseThenAquire {
+                        state_avail,
+                    },
+                }
+            },
+            Ok(Async::Ready(Resource::OutOfStock(state_no_left))) => {
+                core.aquires_count = core.aquires_count.saturating_sub(1);
+                DoWantReleaseFn::OutOfStock {
+                    next_state: StateWantReleaseReq {
+                        state_no_left,
+                    },
+                }
+            },
+            Err(ErrorSeverity::Recoverable { state, }) =>
+                match core.params.restart_strategy {
+                    RestartStrategy::RestartImmediately => {
+                        info!("{} failed: restarting {} immediately", self.source, core.params.name.as_ref());
+                        DoWantReleaseFn::RestartNow {
+                            next_state: StateWantAquireReq {
+                                init_state: state,
+                            },
+                        }
+                    },
+                    RestartStrategy::Delay { restart_after, } => {
+                        info!("{} failed: restarting {} in {:?}", self.source, core.params.name.as_ref(), restart_after);
+                        DoWantReleaseFn::RestartWait {
+                            next_state: StateWantAquireReqRestart {
+                                future: Delay::new(Instant::now() + restart_after),
+                                init_state: state,
+                            },
+                        }
+                    },
+                }
+            Err(ErrorSeverity::Fatal(())) => {
+                error!("{} {} crashed with fatal error, terminating", self.source, core.params.name.as_ref());
+                DoWantReleaseFn::Fatal
+            },
+        }
+    }
 }
 
-struct StateWantReleaseWaitFn<Q> {
+enum DoWantReleaseFn<FUR, S, P, Q> {
+    NotReady { next_state: StateWantReleaseFn<FUR>, },
+    Available { next_state: StateWantReleaseThenAquire<P>, },
+    OutOfStock { next_state: StateWantReleaseReq<Q>, },
+    RestartNow { next_state: StateWantAquireReq<S>, },
+    RestartWait { next_state: StateWantAquireReqRestart<S>, },
+    Fatal,
+}
+
+struct StateWantCloseFn<FUC> {
+    future: FUC,
+    source: &'static str,
+    force_immediately: bool,
+}
+
+impl<FUC> StateWantCloseFn<FUC> {
+    fn step<FNI, FNA, FNRM, FNRW, FNCM, FNCW, N, S, R>(
+        mut self,
+        core: &mut Core<FNI, FNA, FNRM, FNRW, FNCM, FNCW, N, R>,
+    )
+        -> DoWantCloseFn<FUC, S>
+    where FUC: Future<Item = S, Error = ()>,
+          N: AsRef<str>,
+    {
+        debug!("State::WantCloseFn ({})", self.source);
+        match self.future.poll() {
+            Ok(Async::NotReady) =>
+                DoWantCloseFn::NotReady { next_state: self, },
+            Ok(Async::Ready(state)) =>
+                match (self.force_immediately, &core.params.restart_strategy) {
+                    (true, _) | (false, &RestartStrategy::RestartImmediately) => {
+                        info!("restarting {} immediately after {}", core.params.name.as_ref(), self.source);
+                        DoWantCloseFn::RestartNow {
+                            next_state: StateWantAquireReq {
+                                init_state: state,
+                            },
+                        }
+                    },
+                    (false, &RestartStrategy::Delay { restart_after, }) => {
+                        info!("restarting {} in {:?} after {}", core.params.name.as_ref(), restart_after, self.source);
+                        DoWantCloseFn::RestartWait {
+                            next_state: StateWantAquireReqRestart {
+                                future: Delay::new(Instant::now() + restart_after),
+                                init_state: state,
+                            },
+                        }
+                    },
+                }
+            Err(()) => {
+                error!("{} crashed with fatal error, terminating", self.source);
+                DoWantCloseFn::Fatal
+            },
+        }
+    }
+}
+
+enum DoWantCloseFn<FUC, S> {
+    NotReady { next_state: StateWantCloseFn<FUC>, },
+    RestartNow { next_state: StateWantAquireReq<S>, },
+    RestartWait { next_state: StateWantAquireReqRestart<S>, },
+    Fatal,
+}
+
+struct StateWantReleaseReq<Q> {
     state_no_left: Q,
 }
 
-struct StateWantCloseWaitFn<FCW, R> {
-    future: FCW,
-    aquire_req_pending: AquireReq<R>,
+impl<Q> StateWantReleaseReq<Q> {
+    fn step<FNI, FNA, FNRM, FNRW, FRW, FNCM, FNCW, FCW, N, R>(
+        self,
+        core: &mut Core<FNI, FNA, FNRM, FNRW, FNCM, FNCW, N, R>,
+    )
+        -> DoWantReleaseReq<FRW::Future, FCW::Future, Q>
+    where  FNRW: FnMut(Q, Option<R>) -> FRW,
+           FRW: IntoFuture,
+           FNCW: FnMut(Q) -> FCW,
+           FCW: IntoFuture,
+           N: AsRef<str>,
+    {
+        debug!("State::WantReleaseReq");
+        if core.aquires_count == 0 {
+            info!("{} runs out of resources, performing restart", core.params.name.as_ref());
+            return DoWantReleaseReq::Close {
+                next_state: StateWantCloseFn {
+                    future: (core.close_wait_fn)(self.state_no_left).into_future(),
+                    source: "close_wait_fn",
+                    force_immediately: true,
+                },
+            }
+        }
+
+        match core.release_rx.poll() {
+            Ok(Async::NotReady) =>
+                DoWantReleaseReq::NotReady { next_state: self, },
+            Ok(Async::Ready(Some(release_req))) =>
+                if release_req.generation == core.generation {
+                    match release_req.status {
+                        ResourceStatus::Reimburse(resource) => {
+                            debug!("release request (resource reimbursed)");
+                            DoWantReleaseReq::Release {
+                                next_state: StateWantReleaseFn {
+                                    future: (core.release_wait_fn)(self.state_no_left, Some(resource)).into_future(),
+                                    source: "release_wait_fn",
+                                },
+                            }
+                        },
+                        ResourceStatus::ResourceLost => {
+                            debug!("release request (resource lost)");
+                            DoWantReleaseReq::Release {
+                                next_state: StateWantReleaseFn {
+                                    future: (core.release_wait_fn)(self.state_no_left, None).into_future(),
+                                    source: "release_wait_fn",
+                                },
+                            }
+                        },
+                        ResourceStatus::ResourceFault => {
+                            warn!("resource fault report: performing restart");
+                            DoWantReleaseReq::Close {
+                                next_state: StateWantCloseFn {
+                                    future: (core.close_wait_fn)(self.state_no_left).into_future(),
+                                    source: "close_wait_fn",
+                                    force_immediately: false,
+                                },
+                            }
+                        },
+                    }
+                } else {
+                    debug!(
+                        "skipping release request for obsolete resource (generation {} while currently is {})",
+                        release_req.generation,
+                        core.generation,
+                    );
+                    DoWantReleaseReq::TryAgain { next_state: self, }
+                },
+            Ok(Async::Ready(None)) => {
+                debug!("release channel depleted");
+                DoWantReleaseReq::Shutdown
+            },
+            Err(()) => {
+                debug!("release channel outer endpoint dropped");
+                DoWantReleaseReq::Shutdown
+            },
+        }
+    }
 }
 
+enum DoWantReleaseReq<FURW, FUCW, Q> {
+    NotReady { next_state: StateWantReleaseReq<Q>, },
+    Release { next_state: StateWantReleaseFn<FURW>, },
+    Close { next_state: StateWantCloseFn<FUCW>, },
+    TryAgain { next_state: StateWantReleaseReq<Q>, },
+    Shutdown,
+}
 
-// pub fn spawn_link<FNI, FI, FNA, FA, FNRM, FRM, FNRW, FRW, FNCM, FCM, FNCW, FCW, N, S, R, P, Q>(
-//     supervisor: &Supervisor,
-//     params: Params<N>,
-//     init_state: S,
-//     init_fn: FNI,
-//     aquire_fn: FNA,
-//     release_main_fn: FNRM,
-//     release_wait_fn: FNRW,
-//     close_main_fn: FNCM,
-//     close_wait_fn: FNCW,
-// )
-//     -> LodeResource<R>
-// where FNI: FnMut(S) -> FI + Send + 'static,
-//       FI: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>> + 'static,
-//       FI::Future: Send,
-//       FNA: FnMut(P) -> FA + Send + 'static,
-//       FA: IntoFuture<Item = (R, Resource<P, Q>), Error = ErrorSeverity<S, ()>> + 'static,
-//       FA::Future: Send,
-//       FNRM: FnMut(P, Option<R>) -> FRM + Send + 'static,
-//       FRM: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>> + 'static,
-//       FRM::Future: Send,
-//       FNRW: FnMut(Q, Option<R>) -> FRW + Send + 'static,
-//       FRW: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>> + 'static,
-//       FRW::Future: Send,
-//       FNCM: FnMut(P) -> FCM + Send + 'static,
-//       FCM: IntoFuture<Item = S, Error = ()> + Send + 'static,
-//       FCM::Future: Send,
-//       FNCW: FnMut(Q) -> FCW + Send + 'static,
-//       FCW: IntoFuture<Item = S, Error = ()> + Send + 'static,
-//       FCW::Future: Send,
-//       N: AsRef<str> + Send + 'static,
-//       S: Send + 'static,
-//       R: Send + 'static,
-//       P: Send + 'static,
-//       Q: Send + 'static,
-// {
-//     let (aquire_tx_stream, aquire_rx_stream) = mpsc::channel(0);
-//     let (release_tx_stream, release_rx_stream) = mpsc::unbounded();
+#[derive(Clone, PartialEq, Debug)]
+pub enum UsingError<E> {
+    ResourceTaskGone,
+    Fatal(E),
+}
 
-//     let task_future = loop_fn(
-//         RestartState {
-//             peers: Peers {
-//                 aquire_rx: aquire_rx_stream,
-//                 release_rx: release_rx_stream,
-//             },
-//             core: Core {
-//                 aquires_count: 0,
-//                 generation: 0,
-//                 params,
-//                 vtable: VTable {
-//                     aquire_fn,
-//                     release_main_fn,
-//                     release_wait_fn,
-//                     close_main_fn,
-//                     close_wait_fn,
-//                 },
-//             },
-//             aquire_req_pending: None,
-//             init_state,
-//             init_fn,
-//         },
-//         restart_loop,
-//     );
-//     supervisor.spawn_link(task_future);
+pub enum UsingResource<R> {
+    Lost,
+    Reimburse(R),
+}
 
-//     LodeResource {
-//         aquire_tx: aquire_tx_stream,
-//         release_tx: release_tx_stream,
-//     }
-// }
+impl<R> LodeResource<R> {
+    pub fn steal_resource(self) -> impl Future<Item = (R, LodeResource<R>), Error = ()> {
+        let LodeResource { aquire_tx, release_tx, } = self;
+        let (resource_tx, resource_rx) = oneshot::channel();
+        aquire_tx
+            .send(AquireReq { reply_tx: resource_tx, })
+            .map_err(|_send_error| {
+                warn!("resource task is gone while aquiring resource");
+            })
+            .and_then(move |aquire_tx| {
+                resource_rx
+                    .map_err(|oneshot::Canceled| {
+                        warn!("resouce task is gone while receiving aquired resource");
+                    })
+                    .and_then(move |ResourceGen { resource, generation, }| {
+                        release_tx
+                            .send(ReleaseReq { generation, status: ResourceStatus::ResourceLost, })
+                            .map_err(|_send_error| {
+                                warn!("resource task is gone while releasing resource");
+                            })
+                            .map(move |release_tx| {
+                                (resource, LodeResource { aquire_tx, release_tx, })
+                            })
+                    })
+            })
+    }
 
-// struct VTable<FNA, FNRM, FNRW, FNCM, FNCW> {
-//     aquire_fn: FNA,
-//     release_main_fn: FNRM,
-//     release_wait_fn: FNRW,
-//     close_main_fn: FNCM,
-//     close_wait_fn: FNCW,
-// }
+    pub fn using_resource_loop<F, T, E, S, FI>(
+        self,
+        state: S,
+        using_fn: F,
+    )
+        -> impl Future<Item = (T, LodeResource<R>), Error = UsingError<E>>
+    where F: FnMut(R, S) -> FI,
+          FI: IntoFuture<Item = (UsingResource<R>, Loop<T, S>), Error = ErrorSeverity<S, E>>
+    {
+        loop_fn(
+            (self, using_fn, state),
+            move |(LodeResource { aquire_tx, release_tx, }, mut using_fn, state)| {
+                debug!("using_resource_loop: aquiring resource");
+                let (resource_tx, resource_rx) = oneshot::channel();
+                aquire_tx
+                    .send(AquireReq { reply_tx: resource_tx, })
+                    .map_err(|_send_error| {
+                        warn!("resource task is gone while aquiring resource");
+                        UsingError::ResourceTaskGone
+                    })
+                    .and_then(move |aquire_tx| {
+                        resource_rx
+                            .map_err(|oneshot::Canceled| {
+                                warn!("resouce task is gone while receiving aquired resource");
+                                UsingError::ResourceTaskGone
+                            })
+                            .and_then(move |ResourceGen { resource, generation, }| {
+                                debug!("using_resource_loop: resource aquired, passing control to user proc");
+                                using_fn(resource, state)
+                                    .into_future()
+                                    .then(move |using_result| {
+                                        match using_result {
+                                            Ok((maybe_resource, loop_action)) => {
+                                                debug!(
+                                                    "using_resource_loop: resource: {}, loop action: {}, releasing resource",
+                                                    match maybe_resource {
+                                                        UsingResource::Lost =>
+                                                            "lost",
+                                                        UsingResource::Reimburse(..) =>
+                                                            "reimbursed",
+                                                    },
+                                                    match loop_action {
+                                                        Loop::Break(..) =>
+                                                            "break",
+                                                        Loop::Continue(..) =>
+                                                            "continue",
+                                                    },
+                                                );
+                                                release_tx
+                                                    .unbounded_send(ReleaseReq {
+                                                        generation,
+                                                        status: match maybe_resource {
+                                                            UsingResource::Lost =>
+                                                                ResourceStatus::ResourceLost,
+                                                            UsingResource::Reimburse(resource) =>
+                                                                ResourceStatus::Reimburse(resource),
+                                                        },
+                                                    })
+                                                    .map_err(|_send_error| {
+                                                        warn!("resource task is gone while releasing resource");
+                                                        UsingError::ResourceTaskGone
+                                                    })
+                                                    .map(move |()| {
+                                                        let lode = LodeResource { aquire_tx, release_tx, };
+                                                        match loop_action {
+                                                            Loop::Break(item) =>
+                                                                Loop::Break((item, lode)),
+                                                            Loop::Continue(state) =>
+                                                                Loop::Continue((lode, using_fn, state)),
+                                                        }
+                                                    })
+                                            },
+                                            Err(error) => {
+                                                debug!("using_resource_loop: an error occurred, releasing resource");
+                                                release_tx
+                                                    .unbounded_send(ReleaseReq { generation, status: ResourceStatus::ResourceFault, })
+                                                    .map_err(|_send_error| {
+                                                        warn!("resource task is gone while releasing resource");
+                                                        UsingError::ResourceTaskGone
+                                                    })
+                                                    .and_then(move |()| {
+                                                        match error {
+                                                            ErrorSeverity::Recoverable { state, } =>
+                                                                Ok(Loop::Continue((
+                                                                    LodeResource { aquire_tx, release_tx, },
+                                                                    using_fn,
+                                                                    state,
+                                                                ))),
+                                                            ErrorSeverity::Fatal(fatal_error) =>
+                                                                Err(UsingError::Fatal(fatal_error)),
+                                                        }
+                                                    })
+                                            }
+                                        }
+                                    })
+                            })
+                    })
+            })
+    }
 
-// struct Peers<R> {
-//     aquire_rx: AquirePeer<R>,
-//     release_rx: ReleasePeer<R>,
-// }
-
-// struct Core<FNA, FNRM, FNRW, FNCM, FNCW, N> {
-//     params: Params<N>,
-//     vtable: VTable<FNA, FNRM, FNRW, FNCM, FNCW>,
-//     aquires_count: usize,
-//     generation: Generation,
-// }
-
-// struct RestartState<FNI, FNA, FNRM, FNRW, FNCM, FNCW, N, S, R> {
-//     peers: Peers<R>,
-//     core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N>,
-//     aquire_req_pending: Option<AquireReq<R>>,
-//     init_state: S,
-//     init_fn: FNI,
-// }
-
-// fn restart_loop<FNI, FS, FNA, FA, FNRM, FRM, FNRW, FRW, FNCM, FCM, FNCW, FCW, N, S, R, P, Q>(
-//     restart_state: RestartState<FNI, FNA, FNRM, FNRW, FNCM, FNCW, N, S, R>,
-// )
-//     -> impl Future<Item = Loop<(), RestartState<FNI, FNA, FNRM, FNRW, FNCM, FNCW, N, S, R>>, Error = ()>
-// where FNI: FnMut(S) -> FS + Send + 'static,
-//       FS: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>>,
-//       FNA: FnMut(P) -> FA,
-//       FA: IntoFuture<Item = (R, Resource<P, Q>), Error = ErrorSeverity<S, ()>>,
-//       FNRM: FnMut(P, Option<R>) -> FRM,
-//       FRM: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>>,
-//       FNRW: FnMut(Q, Option<R>) -> FRW,
-//       FRW: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>>,
-//       FNCM: FnMut(P) -> FCM,
-//       FCM: IntoFuture<Item = S, Error = ()>,
-//       FNCW: FnMut(Q) -> FCW,
-//       FCW: IntoFuture<Item = S, Error = ()>,
-//       N: AsRef<str>,
-// {
-//     let RestartState { peers, mut core, init_state, mut init_fn, mut aquire_req_pending, } = restart_state;
-//     let future = if let Some(aquire_req) = aquire_req_pending.take() {
-//         Either::A(result(Ok(AquireWait::Arrived { aquire_req, peers, })))
-//     } else {
-//         Either::B(wait_for_aquire(peers))
-//     };
-//     future
-//         .and_then(move |aquire_wait| {
-//             match aquire_wait {
-//                 AquireWait::Arrived { aquire_req, peers, } => {
-//                     let future = init_fn(init_state)
-//                         .into_future()
-//                         .then(move |maybe_lode_state| {
-//                             match maybe_lode_state {
-//                                 Ok(Resource::Available(state_avail)) => {
-//                                     core.generation += 1;
-//                                     let future =
-//                                         loop_fn(OuterState { peers, core, state_avail, aquire_req_pending: Some(aquire_req), }, outer_loop)
-//                                         .then(move |inner_loop_result| {
-//                                             match inner_loop_result {
-//                                                 Ok(BreakOuter::Shutdown) =>
-//                                                     Either::A(result(Ok(Loop::Break(())))),
-//                                                 Ok(BreakOuter::RequireRestart { peers, core, init_state, aquire_req_pending, }) => {
-//                                                     let future = proceed_with_restart(RestartState {
-//                                                         peers, core, init_state, init_fn, aquire_req_pending,
-//                                                     });
-//                                                     Either::B(future)
-//                                                 },
-//                                                 Err(()) =>
-//                                                     Either::A(result(Err(()))),
-//                                             }
-//                                         });
-//                                     Either::A(Either::A(future))
-//                                 },
-//                                 Ok(Resource::OutOfStock(state_no_left)) => {
-//                                     warn!("initializing gives no resource in {}", core.params.name.as_ref());
-//                                     let future = (core.vtable.close_wait_fn)(state_no_left)
-//                                         .into_future()
-//                                         .and_then(move |init_state| {
-//                                             proceed_with_restart(RestartState {
-//                                                 aquire_req_pending: Some(aquire_req),
-//                                                 peers, core, init_state, init_fn,
-//                                             })
-//                                         });
-//                                     Either::A(Either::B(future))
-//                                 },
-//                                 Err(ErrorSeverity::Recoverable { state: init_state, }) => {
-//                                     let future = proceed_with_restart(RestartState {
-//                                         aquire_req_pending: Some(aquire_req),
-//                                         peers, core, init_state, init_fn,
-//                                     });
-//                                     Either::B(Either::A(future))
-//                                 },
-//                                 Err(ErrorSeverity::Fatal(())) => {
-//                                     error!("{} crashed with fatal error, terminating", core.params.name.as_ref());
-//                                     Either::B(Either::B(result(Err(()))))
-//                                 },
-//                             }
-//                         });
-//                     Either::A(future)
-//                 },
-//                 AquireWait::Shutdown =>
-//                     Either::B(result(Ok(Loop::Break(())))),
-//             }
-//         })
-// }
-
-// enum AquireWait<R> {
-//     Arrived { aquire_req: AquireReq<R>, peers: Peers<R>, },
-//     Shutdown,
-// }
-
-// fn wait_for_aquire<R>(peers: Peers<R>) -> impl Future<Item = AquireWait<R>, Error = ()> {
-//     let Peers { aquire_rx, release_rx, } = peers;
-//     aquire_rx
-//         .into_future()
-//         .then(move |await_result| {
-//             match await_result {
-//                 Ok((Some(aquire_req), aquire_rx)) => {
-//                     debug!("wait_for_aquire: aquire request");
-//                     Ok(AquireWait::Arrived {
-//                         aquire_req,
-//                         peers: Peers { aquire_rx, release_rx, },
-//                     })
-//                 },
-//                 Ok((None, _aquire_rx)) => {
-//                     debug!("wait_for_aquire: release channel depleted");
-//                     Ok(AquireWait::Shutdown)
-//                 },
-//                 Err(((), _aquire_rx)) => {
-//                     debug!("wait_for_aquire: aquire channel outer endpoint dropped");
-//                     Ok(AquireWait::Shutdown)
-//                 },
-//             }
-//         })
-// }
-
-// enum BreakOuter<FNA, FNRM, FNRW, FNCM, FNCW, N, S, R> {
-//     Shutdown,
-//     RequireRestart {
-//         peers: Peers<R>,
-//         core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N>,
-//         init_state: S,
-//         aquire_req_pending: Option<AquireReq<R>>,
-//     },
-// }
-
-// struct OuterState<FNA, FNRM, FNRW, FNCM, FNCW, N, R, P> {
-//     peers: Peers<R>,
-//     core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N>,
-//     state_avail: P,
-//     aquire_req_pending: Option<AquireReq<R>>,
-// }
-
-// fn outer_loop<FNA, FA, FNRM, FRM, FNRW, FRW, FNCM, FCM, FNCW, FCW, N, S, R, P, Q>(
-//     outer_state: OuterState<FNA, FNRM, FNRW, FNCM, FNCW, N, R, P>,
-// )
-//     -> impl Future<Item = Loop<BreakOuter<FNA, FNRM, FNRW, FNCM, FNCW, N, S, R>, OuterState<FNA, FNRM, FNRW, FNCM, FNCW, N, R, P>>, Error = ()>
-// where FNA: FnMut(P) -> FA,
-//       FA: IntoFuture<Item = (R, Resource<P, Q>), Error = ErrorSeverity<S, ()>>,
-//       FNRM: FnMut(P, Option<R>) -> FRM,
-//       FRM: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>>,
-//       FNRW: FnMut(Q, Option<R>) -> FRW,
-//       FRW: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>>,
-//       FNCM: FnMut(P) -> FCM,
-//       FCM: IntoFuture<Item = S, Error = ()>,
-//       FNCW: FnMut(Q) -> FCW,
-//       FCW: IntoFuture<Item = S, Error = ()>,
-//       N: AsRef<str>,
-// {
-//     let OuterState { peers, core, state_avail, aquire_req_pending, } = outer_state;
-//     let blender = Blender::new()
-//         .add(peers.aquire_rx)
-//         .add(peers.release_rx)
-//         .finish_sources()
-//         .fold(Either::B, Either::B)
-//         .fold(Either::A, Either::A)
-//         .finish();
-//     loop_fn(MainState { blender, core, state_avail, aquire_req_pending, }, main_loop)
-//         .and_then(move |main_loop_result| {
-//             match main_loop_result {
-//                 BreakMain::Shutdown =>
-//                     Either::A(result(Ok(Loop::Break(BreakOuter::Shutdown)))),
-//                 BreakMain::RequireRestart { peers, core, init_state, aquire_req_pending, } =>
-//                     Either::A(result(Ok(Loop::Break(BreakOuter::RequireRestart { peers, core, init_state, aquire_req_pending, })))),
-//                 BreakMain::WaitRelease { peers, core, state_no_left, } => {
-//                     let Peers { aquire_rx, release_rx, } = peers;
-//                     let future = loop_fn(WaitState { release_rx, core, state_no_left, }, wait_loop)
-//                         .map(move |wait_loop_result| {
-//                             match wait_loop_result {
-//                                 BreakWait::Shutdown =>
-//                                     Loop::Break(BreakOuter::Shutdown),
-//                                 BreakWait::RequireRestart { release_rx, core, init_state, } =>
-//                                     Loop::Break(BreakOuter::RequireRestart {
-//                                         peers: Peers { aquire_rx, release_rx, },
-//                                         aquire_req_pending: None,
-//                                         core, init_state,
-//                                     }),
-//                                 BreakWait::ProceedMain { release_rx, core, state_avail, } =>
-//                                     Loop::Continue(OuterState {
-//                                         peers: Peers { aquire_rx, release_rx, },
-//                                         aquire_req_pending: None,
-//                                         core, state_avail,
-//                                     }),
-//                             }
-//                         });
-//                     Either::B(future)
-//                 },
-//             }
-//         })
-// }
-
-// enum BreakMain<FNA, FNRM, FNRW, FNCM, FNCW, N, S, R, Q> {
-//     Shutdown,
-//     RequireRestart {
-//         peers: Peers<R>,
-//         core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N>,
-//         init_state: S,
-//         aquire_req_pending: Option<AquireReq<R>>,
-//     },
-//     WaitRelease {
-//         peers: Peers<R>,
-//         core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N>,
-//         state_no_left: Q,
-//     },
-// }
-
-// struct MainState<FNA, FNRM, FNRW, FNCM, FNCW, N, R, P, B> {
-//     blender: B,
-//     core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N>,
-//     state_avail: P,
-//     aquire_req_pending: Option<AquireReq<R>>,
-// }
-
-// type BlenderItem<R, B> = (Either<AquireReq<R>, ReleaseReq<R>>, B);
-// type BlenderError<R> = Either<ErrorEvent<(ReleasePeer<R>, ()), Gone, (), ()>, ErrorEvent<(), Gone, (AquirePeer<R>, ()), ()>>;
-
-// fn main_loop<FNA, FA, FNRM, FRM, FNRW, FRW, FNCM, FCM, FNCW, FCW, N, S, R, P, Q, B>(
-//     main_state: MainState<FNA, FNRM, FNRW, FNCM, FNCW, N, R, P, B>,
-// )
-//     -> impl Future<Item = Loop<BreakMain<FNA, FNRM, FNRW, FNCM, FNCW, N, S, R, Q>, MainState<FNA, FNRM, FNRW, FNCM, FNCW, N, R, P, B>>, Error = ()>
-// where FNA: FnMut(P) -> FA,
-//       FA: IntoFuture<Item = (R, Resource<P, Q>), Error = ErrorSeverity<S, ()>>,
-//       FNRM: FnMut(P, Option<R>) -> FRM,
-//       FRM: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>>,
-//       FNRW: FnMut(Q, Option<R>) -> FRW,
-//       FRW: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>>,
-//       FNCM: FnMut(P) -> FCM,
-//       FCM: IntoFuture<Item = S, Error = ()>,
-//       FNCW: FnMut(Q) -> FCW,
-//       FCW: IntoFuture<Item = S, Error = ()>,
-//       N: AsRef<str>,
-//       B: Future<Item = BlenderItem<R, B>, Error = BlenderError<R>> + Decompose<Parts = (AquirePeer<R>, (ReleasePeer<R>, ()))>,
-// {
-//     let MainState {
-//         core: Core { params, mut vtable, aquires_count, generation, },
-//         blender,
-//         state_avail,
-//         aquire_req_pending,
-//     } = main_state;
-
-//     enum AquireProcess<FNA, FNRM, FNRW, FNCM, FNCW, N, S, R, P, Q> {
-//         Proceed { core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N>, state_avail: P, },
-//         WaitRelease { core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N>, state_no_left: Q, },
-//         RequireRestart {
-//             core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N>,
-//             init_state: S,
-//             aquire_req_pending: Option<AquireReq<R>>,
-//         }
-//     }
-
-//     let future = if let Some(AquireReq { reply_tx, }) = aquire_req_pending {
-//         debug!("main_loop: process the aquire request");
-//         let future = (vtable.aquire_fn)(state_avail)
-//             .into_future()
-//             .then(move |aquire_result| {
-//                 match aquire_result {
-//                     Ok((resource, resource_status)) => {
-//                         let aquires_count = match reply_tx.send(ResourceGen { resource, generation, }) {
-//                             Ok(()) =>
-//                                 aquires_count + 1,
-//                             Err(_resource) => {
-//                                 warn!("receiver has been dropped before resource is aquired");
-//                                 aquires_count
-//                             },
-//                         };
-//                         let core = Core { params, vtable, aquires_count, generation, };
-//                         match resource_status {
-//                             Resource::Available(state_avail) =>
-//                                 Ok(AquireProcess::Proceed { core, state_avail, }),
-//                             Resource::OutOfStock(state_no_left) =>
-//                                 Ok(AquireProcess::WaitRelease { core, state_no_left, }),
-//                         }
-
-//                     },
-//                     Err(ErrorSeverity::Recoverable { state: init_state, }) => {
-//                         Ok(AquireProcess::RequireRestart {
-//                             core: Core { params, vtable, aquires_count, generation, },
-//                             aquire_req_pending: Some(AquireReq { reply_tx, }),
-//                             init_state,
-//                         })
-//                     },
-//                     Err(ErrorSeverity::Fatal(())) => {
-//                         error!("{} crashed with fatal error, terminating", params.name.as_ref());
-//                         Err(())
-//                     },
-//                 }
-//             });
-//         Either::A(future)
-//     } else {
-//         Either::B(result(Ok(AquireProcess::Proceed {
-//             core: Core { params, vtable, aquires_count, generation, },
-//             state_avail,
-//         })))
-//     };
-
-//     future
-//         .and_then(move |aquire_process| {
-//             match aquire_process {
-//                 AquireProcess::Proceed { core, state_avail, } => {
-//                     let Core { params, mut vtable, aquires_count, generation, } = core;
-//                     let future = blender
-//                         .then(move |await_result| {
-//                             match await_result {
-//                                 Ok((Either::A(aquire_req), blender)) => {
-//                                     debug!("main_loop: aquire request");
-//                                     Either::B(result(Ok(Loop::Continue(MainState {
-//                                         core: Core { params, vtable, aquires_count, generation, },
-//                                         aquire_req_pending: Some(aquire_req),
-//                                         blender,
-//                                         state_avail,
-//                                     }))))
-//                                 },
-//                                 Ok((Either::B(release_req), blender)) => {
-//                                     if release_req.generation == generation {
-//                                         let maybe_resource = match release_req.status {
-//                                             ResourceStatus::Reimburse(resource) => {
-//                                                 debug!("main_loop: release request (resource reimbursed)");
-//                                                 Some(Some(resource))
-//                                             },
-//                                             ResourceStatus::ResourceLost => {
-//                                                 debug!("main_loop: release request (resource lost)");
-//                                                 Some(None)
-//                                             },
-//                                             ResourceStatus::ResourceFault => {
-//                                                 debug!("main_loop: release request (resource fault)");
-//                                                 None
-//                                             },
-//                                         };
-//                                         let future = if let Some(released_resource) = maybe_resource {
-//                                             // resource is actually released
-//                                             let future = (vtable.release_main_fn)(state_avail, released_resource)
-//                                                 .into_future()
-//                                                 .then(move |release_result| {
-//                                                     let core = Core {
-//                                                         aquires_count: if aquires_count > 0 { aquires_count - 1 } else { 0 },
-//                                                         params, vtable, generation,
-//                                                     };
-//                                                     match release_result {
-//                                                         Ok(Resource::Available(state_avail)) =>
-//                                                             Ok(Loop::Continue(MainState { blender, core, state_avail, aquire_req_pending: None, })),
-//                                                         Ok(Resource::OutOfStock(state_no_left)) => {
-//                                                             let (aquire_rx, (release_rx, ())) = blender.decompose();
-//                                                             let peers = Peers { aquire_rx, release_rx, };
-//                                                             Ok(Loop::Break(BreakMain::WaitRelease { peers, core, state_no_left, }))
-//                                                         },
-//                                                         Err(ErrorSeverity::Recoverable { state: init_state, }) => {
-//                                                             let (aquire_rx, (release_rx, ())) = blender.decompose();
-//                                                             let peers = Peers { aquire_rx, release_rx, };
-//                                                             Ok(Loop::Break(BreakMain::RequireRestart {
-//                                                                 peers, core, init_state, aquire_req_pending: None,
-//                                                             }))
-//                                                         },
-//                                                         Err(ErrorSeverity::Fatal(())) => {
-//                                                             error!("{} crashed with fatal error, terminating", core.params.name.as_ref());
-//                                                             Err(())
-//                                                         },
-//                                                     }
-//                                                 });
-//                                             Either::A(future)
-//                                         } else {
-//                                             // something wrong with resource, schedule restart
-//                                             warn!("resource fault report: performing restart");
-//                                             let future = (vtable.close_main_fn)(state_avail)
-//                                                 .into_future()
-//                                                 .map(move |init_state| {
-//                                                     let (aquire_rx, (release_rx, ())) = blender.decompose();
-//                                                     let peers = Peers { aquire_rx, release_rx, };
-//                                                     Loop::Break(BreakMain::RequireRestart {
-//                                                         core: Core {
-//                                                             aquires_count: if aquires_count > 0 { aquires_count - 1 } else { 0 },
-//                                                             params, vtable, generation,
-//                                                         },
-//                                                         aquire_req_pending: None,
-//                                                         init_state,
-//                                                         peers,
-//                                                     })
-//                                                 });
-//                                             Either::B(future)
-//                                         };
-//                                         Either::A(future)
-//                                     } else {
-//                                         debug!("main_loop: skipping obsolete release request");
-//                                         Either::B(result(Ok(Loop::Continue(MainState {
-//                                             core: Core { params, vtable, aquires_count, generation, },
-//                                             aquire_req_pending: None,
-//                                             state_avail,
-//                                             blender,
-//                                         }))))
-//                                     }
-//                                 },
-//                                 Err(Either::A(ErrorEvent::Depleted {
-//                                     decomposed: DecomposeZip { left_dir: (_release_rx, ()), myself: Gone, right_rev: (), },
-//                                 })) => {
-//                                     debug!("main_loop: aquire channel depleted");
-//                                     Either::B(result(Ok(Loop::Break(BreakMain::Shutdown))))
-//                                 },
-//                                 Err(Either::A(ErrorEvent::Error {
-//                                     error: (),
-//                                     decomposed: DecomposeZip { left_dir: (_release_rx, ()), myself: Gone, right_rev: (), },
-//                                 })) => {
-//                                     debug!("main_loop: aquire channel outer endpoint dropped");
-//                                     Either::B(result(Ok(Loop::Break(BreakMain::Shutdown))))
-//                                 },
-//                                 Err(Either::B(ErrorEvent::Depleted {
-//                                     decomposed: DecomposeZip { left_dir: (), myself: Gone, right_rev: (_aquire_rx, ()), },
-//                                 })) => {
-//                                     debug!("main_loop: release channel depleted");
-//                                     Either::B(result(Ok(Loop::Break(BreakMain::Shutdown))))
-//                                 },
-//                                 Err(Either::B(ErrorEvent::Error {
-//                                     error: (),
-//                                     decomposed: DecomposeZip { left_dir: (), myself: Gone, right_rev: (_aquire_rx, ()), },
-//                                 })) => {
-//                                     debug!("main_loop: release channel outer endpoint dropped");
-//                                     Either::B(result(Ok(Loop::Break(BreakMain::Shutdown))))
-//                                 },
-//                             }
-//                         });
-//                     Either::A(future)
-//                 },
-//                 AquireProcess::WaitRelease { core, state_no_left, } => {
-//                     let (aquire_rx, (release_rx, ())) = blender.decompose();
-//                     let peers = Peers { aquire_rx, release_rx, };
-//                     Either::B(result(Ok(Loop::Break(BreakMain::WaitRelease { peers, core, state_no_left, }))))
-//                 },
-//                 AquireProcess::RequireRestart { core, init_state, aquire_req_pending, } => {
-//                     let (aquire_rx, (release_rx, ())) = blender.decompose();
-//                     let peers = Peers { aquire_rx, release_rx, };
-//                     Either::B(result(Ok(Loop::Break(BreakMain::RequireRestart { peers, core, init_state, aquire_req_pending, }))))
-//                 },
-//             }
-//         })
-// }
-
-// enum BreakWait<FNA, FNRM, FNRW, FNCM, FNCW, N, S, R, P> {
-//     Shutdown,
-//     RequireRestart {
-//         release_rx: ReleasePeer<R>,
-//         core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N>,
-//         init_state: S,
-//     },
-//     ProceedMain {
-//         release_rx: ReleasePeer<R>,
-//         core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N>,
-//         state_avail: P,
-//     },
-// }
-
-// struct WaitState<FNA, FNRM, FNRW, FNCM, FNCW, N, R, Q> {
-//     release_rx: ReleasePeer<R>,
-//     core: Core<FNA, FNRM, FNRW, FNCM, FNCW, N>,
-//     state_no_left: Q,
-// }
-
-// fn wait_loop<FNA, FA, FNRM, FRM, FNRW, FRW, FNCM, FCM, FNCW, FCW, N, S, R, P, Q>(
-//     wait_state: WaitState<FNA, FNRM, FNRW, FNCM, FNCW, N, R, Q>,
-// )
-//     -> impl Future<Item = Loop<BreakWait<FNA, FNRM, FNRW, FNCM, FNCW, N, S, R, P>, WaitState<FNA, FNRM, FNRW, FNCM, FNCW, N, R, Q>>, Error = ()>
-// where FNA: FnMut(P) -> FA,
-//       FA: IntoFuture<Item = (R, Resource<P, Q>), Error = ErrorSeverity<S, ()>>,
-//       FNRM: FnMut(P, Option<R>) -> FRM,
-//       FRM: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>>,
-//       FNRW: FnMut(Q, Option<R>) -> FRW,
-//       FRW: IntoFuture<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>>,
-//       FNCM: FnMut(P) -> FCM,
-//       FCM: IntoFuture<Item = S, Error = ()>,
-//       FNCW: FnMut(Q) -> FCW,
-//       FCW: IntoFuture<Item = S, Error = ()>,
-//       N: AsRef<str>,
-// {
-//     let WaitState {
-//         core: Core { params, mut vtable, aquires_count, generation, },
-//         release_rx,
-//         state_no_left,
-//     } = wait_state;
-
-//     release_rx
-//         .into_future()
-//         .then(move |await_result| {
-//             match await_result {
-//                 Ok((Some(ReleaseReq { generation: release_gen, status, }), release_rx)) => {
-//                     if release_gen == generation {
-//                         let maybe_resource = match status {
-//                             ResourceStatus::Reimburse(resource) => {
-//                                 debug!("wait_loop: release request (resource reimbursed)");
-//                                 Some(Some(resource))
-//                             },
-//                             ResourceStatus::ResourceLost => {
-//                                 debug!("wait_loop: release request (resource lost)");
-//                                 Some(None)
-//                             },
-//                             ResourceStatus::ResourceFault => {
-//                                 debug!("wait_loop: release request (resource fault)");
-//                                 None
-//                             },
-//                         };
-//                         let future = if let Some(released_resource) = maybe_resource {
-//                             // resource is actually released
-//                             let future = (vtable.release_wait_fn)(state_no_left, released_resource)
-//                                 .into_future()
-//                                 .then(move |release_result| {
-//                                     let mut core = Core {
-//                                         aquires_count: if aquires_count > 0 { aquires_count - 1 } else { 0 },
-//                                         params, vtable, generation,
-//                                     };
-//                                     match release_result {
-//                                         Ok(Resource::Available(state_avail)) => {
-//                                             debug!("{} got more resources, proceeding to main loop", core.params.name.as_ref());
-//                                             Either::A(result(Ok(Loop::Break(BreakWait::ProceedMain { release_rx, core, state_avail, }))))
-//                                         },
-//                                         Ok(Resource::OutOfStock(state_no_left)) => {
-//                                             debug!("{} got no more resources, aquires left: {}", core.params.name.as_ref(), core.aquires_count);
-//                                             if core.aquires_count > 0 {
-//                                                 Either::A(result(Ok(Loop::Continue(WaitState { release_rx, core, state_no_left, }))))
-//                                             } else {
-//                                                 info!("{} runs out of resources, performing restart", core.params.name.as_ref());
-//                                                 let future = (core.vtable.close_wait_fn)(state_no_left)
-//                                                     .into_future()
-//                                                     .map(move |init_state| {
-//                                                         Loop::Break(BreakWait::RequireRestart { release_rx, core, init_state, })
-//                                                     });
-//                                                 Either::B(future)
-//                                             }
-//                                         },
-//                                         Err(ErrorSeverity::Recoverable { state: init_state, }) =>
-//                                             Either::A(result(Ok(Loop::Break(BreakWait::RequireRestart { release_rx, core, init_state, })))),
-//                                         Err(ErrorSeverity::Fatal(())) => {
-//                                             error!("{} crashed with fatal error, terminating", core.params.name.as_ref());
-//                                             Either::A(result(Err(())))
-//                                         },
-//                                     }
-//                                 });
-//                             Either::A(future)
-//                         } else {
-//                             // something wrong with resource, schedule restart
-//                             warn!("resource fault report: performing restart");
-//                             let future = (vtable.close_wait_fn)(state_no_left)
-//                                 .into_future()
-//                                 .map(move |init_state| {
-//                                     Loop::Break(BreakWait::RequireRestart {
-//                                         core: Core {
-//                                             aquires_count: if aquires_count > 0 { aquires_count - 1 } else { 0 },
-//                                             params, vtable, generation,
-//                                         },
-//                                         init_state,
-//                                         release_rx,
-//                                     })
-//                                 });
-//                             Either::B(future)
-//                         };
-//                         Either::A(future)
-//                     } else {
-//                         debug!("wait_loop: skipping obsolete release request");
-//                         let core = Core { params, vtable, aquires_count, generation, };
-//                         Either::B(result(Ok(Loop::Continue(WaitState { release_rx, core, state_no_left, }))))
-//                     }
-//                 },
-//                 Ok((None, _release_rx)) => {
-//                     debug!("wait_loop: release channel depleted");
-//                     Either::B(result(Ok(Loop::Break(BreakWait::Shutdown))))
-//                 },
-//                 Err(((), _release_rx)) => {
-//                     debug!("wait_loop: release channel outer endpoint dropped");
-//                     Either::B(result(Ok(Loop::Break(BreakWait::Shutdown))))
-//                 },
-//             }
-//         })
-// }
-
-// fn proceed_with_restart<FNI, FNA, FNRM, FNRW, FNCM, FNCW, N, S, R>(
-//     restart_state: RestartState<FNI, FNA, FNRM, FNRW, FNCM, FNCW, N, S, R>,
-// )
-//     -> impl Future<Item = Loop<(), RestartState<FNI, FNA, FNRM, FNRW, FNCM, FNCW, N, S, R>>, Error = ()>
-// where N: AsRef<str>,
-// {
-//     match restart_state.core.params.restart_strategy {
-//         RestartStrategy::RestartImmediately => {
-//             info!("restarting {} immediately", restart_state.core.params.name.as_ref());
-//             Either::B(result(Ok(Loop::Continue(restart_state))))
-//         },
-//         RestartStrategy::Delay { restart_after, } => {
-//             info!("restarting {} in {:?}", restart_state.core.params.name.as_ref(), restart_after);
-//             let future = Delay::new(Instant::now() + restart_after)
-//                 .then(|_delay_result| Ok(Loop::Continue(restart_state)));
-//             Either::A(future)
-//         },
-//     }
-// }
-
-// #[derive(Clone, PartialEq, Debug)]
-// pub enum UsingError<E> {
-//     ResourceTaskGone,
-//     Fatal(E),
-// }
-
-// pub enum UsingResource<R> {
-//     Lost,
-//     Reimburse(R),
-// }
-
-// impl<R> LodeResource<R> {
-//     pub fn steal_resource(self) -> impl Future<Item = (R, LodeResource<R>), Error = ()> {
-//         let LodeResource { aquire_tx, release_tx, } = self;
-//         let (resource_tx, resource_rx) = oneshot::channel();
-//         aquire_tx
-//             .send(AquireReq { reply_tx: resource_tx, })
-//             .map_err(|_send_error| {
-//                 warn!("resource task is gone while aquiring resource");
-//             })
-//             .and_then(move |aquire_tx| {
-//                 resource_rx
-//                     .map_err(|oneshot::Canceled| {
-//                         warn!("resouce task is gone while receiving aquired resource");
-//                     })
-//                     .and_then(move |ResourceGen { resource, generation, }| {
-//                         release_tx
-//                             .send(ReleaseReq { generation, status: ResourceStatus::ResourceLost, })
-//                             .map_err(|_send_error| {
-//                                 warn!("resource task is gone while releasing resource");
-//                             })
-//                             .map(move |release_tx| {
-//                                 (resource, LodeResource { aquire_tx, release_tx, })
-//                             })
-//                     })
-//             })
-//     }
-
-//     pub fn using_resource_loop<F, T, E, S, FI>(
-//         self,
-//         state: S,
-//         using_fn: F,
-//     )
-//         -> impl Future<Item = (T, LodeResource<R>), Error = UsingError<E>>
-//     where F: FnMut(R, S) -> FI,
-//           FI: IntoFuture<Item = (UsingResource<R>, Loop<T, S>), Error = ErrorSeverity<S, E>>
-//     {
-//         loop_fn(
-//             (self, using_fn, state),
-//             move |(LodeResource { aquire_tx, release_tx, }, mut using_fn, state)| {
-//                 debug!("using_resource_loop: aquiring resource");
-//                 let (resource_tx, resource_rx) = oneshot::channel();
-//                 aquire_tx
-//                     .send(AquireReq { reply_tx: resource_tx, })
-//                     .map_err(|_send_error| {
-//                         warn!("resource task is gone while aquiring resource");
-//                         UsingError::ResourceTaskGone
-//                     })
-//                     .and_then(move |aquire_tx| {
-//                         resource_rx
-//                             .map_err(|oneshot::Canceled| {
-//                                 warn!("resouce task is gone while receiving aquired resource");
-//                                 UsingError::ResourceTaskGone
-//                             })
-//                             .and_then(move |ResourceGen { resource, generation, }| {
-//                                 debug!("using_resource_loop: resource aquired, passing control to user proc");
-//                                 using_fn(resource, state)
-//                                     .into_future()
-//                                     .then(move |using_result| {
-//                                         match using_result {
-//                                             Ok((maybe_resource, loop_action)) => {
-//                                                 debug!(
-//                                                     "using_resource_loop: resource: {}, loop action: {}, releasing resource",
-//                                                     match maybe_resource {
-//                                                         UsingResource::Lost =>
-//                                                             "lost",
-//                                                         UsingResource::Reimburse(..) =>
-//                                                             "reimbursed",
-//                                                     },
-//                                                     match loop_action {
-//                                                         Loop::Break(..) =>
-//                                                             "break",
-//                                                         Loop::Continue(..) =>
-//                                                             "continue",
-//                                                     },
-//                                                 );
-//                                                 release_tx
-//                                                     .unbounded_send(ReleaseReq {
-//                                                         generation,
-//                                                         status: match maybe_resource {
-//                                                             UsingResource::Lost =>
-//                                                                 ResourceStatus::ResourceLost,
-//                                                             UsingResource::Reimburse(resource) =>
-//                                                                 ResourceStatus::Reimburse(resource),
-//                                                         },
-//                                                     })
-//                                                     .map_err(|_send_error| {
-//                                                         warn!("resource task is gone while releasing resource");
-//                                                         UsingError::ResourceTaskGone
-//                                                     })
-//                                                     .map(move |()| {
-//                                                         let lode = LodeResource { aquire_tx, release_tx, };
-//                                                         match loop_action {
-//                                                             Loop::Break(item) =>
-//                                                                 Loop::Break((item, lode)),
-//                                                             Loop::Continue(state) =>
-//                                                                 Loop::Continue((lode, using_fn, state)),
-//                                                         }
-//                                                     })
-//                                             },
-//                                             Err(error) => {
-//                                                 debug!("using_resource_loop: an error occurred, releasing resource");
-//                                                 release_tx
-//                                                     .unbounded_send(ReleaseReq { generation, status: ResourceStatus::ResourceFault, })
-//                                                     .map_err(|_send_error| {
-//                                                         warn!("resource task is gone while releasing resource");
-//                                                         UsingError::ResourceTaskGone
-//                                                     })
-//                                                     .and_then(move |()| {
-//                                                         match error {
-//                                                             ErrorSeverity::Recoverable { state, } =>
-//                                                                 Ok(Loop::Continue((
-//                                                                     LodeResource { aquire_tx, release_tx, },
-//                                                                     using_fn,
-//                                                                     state,
-//                                                                 ))),
-//                                                             ErrorSeverity::Fatal(fatal_error) =>
-//                                                                 Err(UsingError::Fatal(fatal_error)),
-//                                                         }
-//                                                     })
-//                                             }
-//                                         }
-//                                     })
-//                             })
-//                     })
-//             })
-//     }
-
-//     pub fn using_resource_once<F, T, E, S, FI>(
-//         self,
-//         state: S,
-//         mut using_fn: F,
-//     )
-//         -> impl Future<Item = (T, LodeResource<R>), Error = UsingError<E>>
-//     where F: FnMut(R, S) -> FI,
-//           FI: IntoFuture<Item = (UsingResource<R>, T), Error = ErrorSeverity<S, E>>
-//     {
-//         self.using_resource_loop(
-//             state,
-//             move |resource, state| {
-//                 using_fn(resource, state)
-//                     .into_future()
-//                     .map(|(using_resource, value)| (using_resource, Loop::Break(value)))
-//             },
-//         )
-//     }
-// }
+    pub fn using_resource_once<F, T, E, S, FI>(
+        self,
+        state: S,
+        mut using_fn: F,
+    )
+        -> impl Future<Item = (T, LodeResource<R>), Error = UsingError<E>>
+    where F: FnMut(R, S) -> FI,
+          FI: IntoFuture<Item = (UsingResource<R>, T), Error = ErrorSeverity<S, E>>
+    {
+        self.using_resource_loop(
+            state,
+            move |resource, state| {
+                using_fn(resource, state)
+                    .into_future()
+                    .map(|(using_resource, value)| (using_resource, Loop::Break(value)))
+            },
+        )
+    }
+}
