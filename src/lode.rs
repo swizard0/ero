@@ -443,7 +443,7 @@ impl<S> StateWantAquireReq<S> {
           FI: IntoFuture,
           N: AsRef<str>,
     {
-        debug!("State::WantAquireReq | {}", core.params.name.as_ref());
+        debug!("{} | State::WantAquireReq", core.params.name.as_ref());
         match core.aquire_rx.poll() {
             Ok(Async::NotReady) =>
                 DoWantAquireReq::NotReady { next_state: self, },
@@ -455,11 +455,11 @@ impl<S> StateWantAquireReq<S> {
                     },
                 },
             Ok(Async::Ready(None)) => {
-                debug!("aquire channel depleted");
+                debug!("{} | aquire channel depleted", core.params.name.as_ref());
                 DoWantAquireReq::Shutdown
             },
             Err(()) => {
-                debug!("aquire channel outer endpoint dropped");
+                debug!("{} | aquire channel outer endpoint dropped", core.params.name.as_ref());
                 DoWantAquireReq::Shutdown
             },
         }
@@ -492,7 +492,7 @@ impl<FUI, R> StateWantInitFn<FUI, R> {
           FCW: IntoFuture,
           N: AsRef<str>,
     {
-        debug!("State::WantInitFn | {}", core.params.name.as_ref());
+        debug!("{} | State::WantInitFn", core.params.name.as_ref());
         match self.future.poll() {
             Ok(Async::NotReady) =>
                 DoWantInitFn::NotReady { next_state: self, },
@@ -507,7 +507,7 @@ impl<FUI, R> StateWantInitFn<FUI, R> {
                 }
             },
             Ok(Async::Ready(Resource::OutOfStock(state_no_left))) => {
-                warn!("init_fn gives no resource in {}", core.params.name.as_ref());
+                warn!("{} | init_fn gives no resource", core.params.name.as_ref());
                 DoWantInitFn::Close {
                     next_state: StateWantInitFnClose {
                         future: (core.close_wait_fn)(state_no_left).into_future(),
@@ -518,7 +518,7 @@ impl<FUI, R> StateWantInitFn<FUI, R> {
             Err(ErrorSeverity::Recoverable { state, }) =>
                 match core.params.restart_strategy {
                     RestartStrategy::RestartImmediately => {
-                        info!("init_fn failed: restarting {} immediately", core.params.name.as_ref());
+                        info!("{} | init_fn failed: restarting immediately", core.params.name.as_ref());
                         DoWantInitFn::RestartNow {
                             next_state: StateWantInitFn {
                                 future: (core.init_fn)(state).into_future(),
@@ -527,7 +527,7 @@ impl<FUI, R> StateWantInitFn<FUI, R> {
                         }
                     },
                     RestartStrategy::Delay { restart_after, } => {
-                        info!("init_fn failed: restarting {} in {:?}", core.params.name.as_ref(), restart_after);
+                        info!("{} | init_fn failed: restarting in {:?}", core.params.name.as_ref(), restart_after);
                         DoWantInitFn::RestartWait {
                             next_state: StateWantInitFnRestart {
                                 future: Delay::new(Instant::now() + restart_after),
@@ -538,7 +538,7 @@ impl<FUI, R> StateWantInitFn<FUI, R> {
                     },
                 }
             Err(ErrorSeverity::Fatal(())) => {
-                error!("init_fn {} crashed with fatal error, terminating", core.params.name.as_ref());
+                error!("{} | init_fn crashed with fatal error, terminating", core.params.name.as_ref());
                 DoWantInitFn::Fatal
             },
         }
@@ -570,7 +570,7 @@ impl<S, R> StateWantInitFnRestart<S, R> {
           FI: IntoFuture,
           N: AsRef<str>,
     {
-        debug!("State::WantInitFnRestart | {}", core.params.name.as_ref());
+        debug!("{} | State::WantInitFnRestart", core.params.name.as_ref());
         match self.future.poll() {
             Ok(Async::NotReady) =>
                 DoWantInitFnRestart::NotReady { next_state: self, },
@@ -582,7 +582,7 @@ impl<S, R> StateWantInitFnRestart<S, R> {
                     },
                 },
             Err(error) => {
-                error!("timer future crashed with fatal error: {:?}, terminating", error);
+                error!("{} | timer future crashed with fatal error: {:?}, terminating", core.params.name.as_ref(), error);
                 DoWantInitFnRestart::Fatal
             },
         }
@@ -608,7 +608,7 @@ impl<S> StateWantAquireReqRestart<S> {
         -> DoWantAquireReqRestart<S>
     where N: AsRef<str>,
     {
-        debug!("State::WantAquireReqRestart | {}", core.params.name.as_ref());
+        debug!("{} | State::WantAquireReqRestart", core.params.name.as_ref());
         match self.future.poll() {
             Ok(Async::NotReady) =>
                 DoWantAquireReqRestart::NotReady { next_state: self, },
@@ -619,7 +619,7 @@ impl<S> StateWantAquireReqRestart<S> {
                     },
                 },
             Err(error) => {
-                error!("timer future crashed with fatal error: {:?}, terminating", error);
+                error!("{} | timer future crashed with fatal error: {:?}, terminating", core.params.name.as_ref(), error);
                 DoWantAquireReqRestart::Fatal
             },
         }
@@ -648,14 +648,14 @@ impl<FUC, R> StateWantInitFnClose<FUC, R> {
           FUC: Future<Item = S, Error = ()>,
           N: AsRef<str>,
     {
-        debug!("State::WantInitFnClose | {}", core.params.name.as_ref());
+        debug!("{} | State::WantInitFnClose", core.params.name.as_ref());
         match self.future.poll() {
             Ok(Async::NotReady) =>
                 DoWantInitFnClose::NotReady { next_state: self, },
             Ok(Async::Ready(state)) =>
                 match core.params.restart_strategy {
                     RestartStrategy::RestartImmediately => {
-                        info!("restarting {} immediately after close_wait_fn", core.params.name.as_ref());
+                        info!("{} | restarting immediately after close_wait_fn", core.params.name.as_ref());
                         DoWantInitFnClose::RestartNow {
                             next_state: StateWantInitFn {
                                 future: (core.init_fn)(state).into_future(),
@@ -664,7 +664,7 @@ impl<FUC, R> StateWantInitFnClose<FUC, R> {
                         }
                     },
                     RestartStrategy::Delay { restart_after, } => {
-                        info!("restarting {} in {:?} after close_wait_fn", core.params.name.as_ref(), restart_after);
+                        info!("{} | restarting in {:?} after close_wait_fn", core.params.name.as_ref(), restart_after);
                         DoWantInitFnClose::RestartWait {
                             next_state: StateWantInitFnRestart {
                                 future: Delay::new(Instant::now() + restart_after),
@@ -675,7 +675,7 @@ impl<FUC, R> StateWantInitFnClose<FUC, R> {
                     },
                 }
             Err(()) => {
-                error!("close_wait_fn crashed with fatal error, terminating");
+                error!("{} close_wait_fn crashed with fatal error, terminating", core.params.name.as_ref());
                 DoWantInitFnClose::Fatal
             },
         }
@@ -705,7 +705,7 @@ impl<FUA, R> StateWantAquireFn<FUA, R> {
           FUA: Future<Item = (R, Resource<P, Q>), Error = ErrorSeverity<S, ()>>,
           N: AsRef<str>,
     {
-        debug!("State::WantAquireFn | {}", core.params.name.as_ref());
+        debug!("{} | State::WantAquireFn", core.params.name.as_ref());
         match self.future.poll() {
             Ok(Async::NotReady) =>
                 DoWantAquireFn::NotReady { next_state: self, },
@@ -714,7 +714,7 @@ impl<FUA, R> StateWantAquireFn<FUA, R> {
                     Ok(()) =>
                         core.aquires_count += 1,
                     Err(_resource) =>
-                        warn!("receiver has been dropped before resource is aquired"),
+                        warn!("{} | receiver has been dropped before resource is aquired", core.params.name.as_ref()),
                 };
                 match resource_status {
                     Resource::Available(state_avail) =>
@@ -734,7 +734,7 @@ impl<FUA, R> StateWantAquireFn<FUA, R> {
             Err(ErrorSeverity::Recoverable { state, }) =>
                 match core.params.restart_strategy {
                     RestartStrategy::RestartImmediately => {
-                        info!("aquire_fn failed: restarting {} immediately", core.params.name.as_ref());
+                        info!("{} | aquire_fn failed: restarting immediately", core.params.name.as_ref());
                         DoWantAquireFn::RestartNow {
                             next_state: StateWantInitFn {
                                 future: (core.init_fn)(state).into_future(),
@@ -743,7 +743,7 @@ impl<FUA, R> StateWantAquireFn<FUA, R> {
                         }
                     },
                     RestartStrategy::Delay { restart_after, } => {
-                        info!("aquire_fn failed: restarting {} in {:?}", core.params.name.as_ref(), restart_after);
+                        info!("{} | aquire_fn failed: restarting in {:?}", core.params.name.as_ref(), restart_after);
                         DoWantAquireFn::RestartWait {
                             next_state: StateWantInitFnRestart {
                                 future: Delay::new(Instant::now() + restart_after),
@@ -754,7 +754,7 @@ impl<FUA, R> StateWantAquireFn<FUA, R> {
                     },
                 }
             Err(ErrorSeverity::Fatal(())) => {
-                error!("aquire_fn {} crashed with fatal error, terminating", core.params.name.as_ref());
+                error!("{} | aquire_fn crashed with fatal error, terminating", core.params.name.as_ref());
                 DoWantAquireFn::Fatal
             },
         }
@@ -784,7 +784,7 @@ impl<P> StateWantAquireThenRelease<P> {
           FA: IntoFuture,
           N: AsRef<str>,
     {
-        debug!("State::WantAquireThenRelease | {}", core.params.name.as_ref());
+        debug!("{} | State::WantAquireThenRelease", core.params.name.as_ref());
         match core.aquire_rx.poll() {
             Ok(Async::NotReady) =>
                 DoWantAquireThenRelease::NotReady {
@@ -800,11 +800,11 @@ impl<P> StateWantAquireThenRelease<P> {
                     },
                 },
             Ok(Async::Ready(None)) => {
-                debug!("aquire channel depleted");
+                debug!("{} | aquire channel depleted", core.params.name.as_ref());
                 DoWantAquireThenRelease::Shutdown
             },
             Err(()) => {
-                debug!("aquire channel outer endpoint dropped");
+                debug!("{} | aquire channel outer endpoint dropped", core.params.name.as_ref());
                 DoWantAquireThenRelease::Shutdown
             },
         }
@@ -833,7 +833,7 @@ impl<P> StateWantReleaseThenAquire<P> {
            FCM: IntoFuture,
            N: AsRef<str>,
     {
-        debug!("State::WantReleaseThenAquire | {}", core.params.name.as_ref());
+        debug!("{} | State::WantReleaseThenAquire", core.params.name.as_ref());
         match core.release_rx.poll() {
             Ok(Async::NotReady) =>
                 DoWantReleaseThenAquire::NotReady {
@@ -845,7 +845,7 @@ impl<P> StateWantReleaseThenAquire<P> {
                 if release_req.generation == core.generation {
                     match release_req.status {
                         ResourceStatus::Reimburse(resource) => {
-                            debug!("release request (resource reimbursed)");
+                            debug!("{} | release request (resource reimbursed)", core.params.name.as_ref());
                             DoWantReleaseThenAquire::Release {
                                 next_state: StateWantReleaseFn {
                                     future: (core.release_main_fn)(self.state_avail, Some(resource)).into_future(),
@@ -854,7 +854,7 @@ impl<P> StateWantReleaseThenAquire<P> {
                             }
                         },
                         ResourceStatus::ResourceLost => {
-                            debug!("release request (resource lost)");
+                            debug!("{} | release request (resource lost)", core.params.name.as_ref());
                             DoWantReleaseThenAquire::Release {
                                 next_state: StateWantReleaseFn {
                                     future: (core.release_main_fn)(self.state_avail, None).into_future(),
@@ -863,7 +863,7 @@ impl<P> StateWantReleaseThenAquire<P> {
                             }
                         },
                         ResourceStatus::ResourceFault => {
-                            warn!("resource fault report: performing restart");
+                            warn!("{} | resource fault report: performing restart", core.params.name.as_ref());
                             DoWantReleaseThenAquire::Close {
                                 next_state: StateWantCloseFn {
                                     future: (core.close_main_fn)(self.state_avail).into_future(),
@@ -882,11 +882,11 @@ impl<P> StateWantReleaseThenAquire<P> {
                     DoWantReleaseThenAquire::TryAgain { next_state: self, }
                 },
             Ok(Async::Ready(None)) => {
-                debug!("release channel depleted");
+                debug!("{} | release channel depleted", core.params.name.as_ref());
                 DoWantReleaseThenAquire::Shutdown
             },
             Err(()) => {
-                debug!("release channel outer endpoint dropped");
+                debug!("{} | release channel outer endpoint dropped", core.params.name.as_ref());
                 DoWantReleaseThenAquire::Shutdown
             },
         }
@@ -915,7 +915,7 @@ impl<FUR> StateWantReleaseFn<FUR> {
     where FUR: Future<Item = Resource<P, Q>, Error = ErrorSeverity<S, ()>>,
           N: AsRef<str>,
     {
-        debug!("State::WantReleaseFn ({}) | {}", core.params.name.as_ref(), self.source);
+        debug!("{} | State::WantReleaseFn ({})", core.params.name.as_ref(), self.source);
         match self.future.poll() {
             Ok(Async::NotReady) =>
                 DoWantReleaseFn::NotReady { next_state: self, },
@@ -938,7 +938,7 @@ impl<FUR> StateWantReleaseFn<FUR> {
             Err(ErrorSeverity::Recoverable { state, }) =>
                 match core.params.restart_strategy {
                     RestartStrategy::RestartImmediately => {
-                        info!("{} failed: restarting {} immediately", self.source, core.params.name.as_ref());
+                        info!("{} | {} failed: restarting immediately", core.params.name.as_ref(), self.source);
                         DoWantReleaseFn::RestartNow {
                             next_state: StateWantAquireReq {
                                 init_state: state,
@@ -946,7 +946,7 @@ impl<FUR> StateWantReleaseFn<FUR> {
                         }
                     },
                     RestartStrategy::Delay { restart_after, } => {
-                        info!("{} failed: restarting {} in {:?}", self.source, core.params.name.as_ref(), restart_after);
+                        info!("{} | {} failed: restarting in {:?}", core.params.name.as_ref(), self.source, restart_after);
                         DoWantReleaseFn::RestartWait {
                             next_state: StateWantAquireReqRestart {
                                 future: Delay::new(Instant::now() + restart_after),
@@ -956,7 +956,7 @@ impl<FUR> StateWantReleaseFn<FUR> {
                     },
                 }
             Err(ErrorSeverity::Fatal(())) => {
-                error!("{} {} crashed with fatal error, terminating", self.source, core.params.name.as_ref());
+                error!("{} | {} crashed with fatal error, terminating", core.params.name.as_ref(), self.source);
                 DoWantReleaseFn::Fatal
             },
         }
@@ -987,14 +987,14 @@ impl<FUC> StateWantCloseFn<FUC> {
     where FUC: Future<Item = S, Error = ()>,
           N: AsRef<str>,
     {
-        debug!("State::WantCloseFn ({}) | {}", core.params.name.as_ref(), self.source);
+        debug!("{} | State::WantCloseFn ({})", core.params.name.as_ref(), self.source);
         match self.future.poll() {
             Ok(Async::NotReady) =>
                 DoWantCloseFn::NotReady { next_state: self, },
             Ok(Async::Ready(state)) =>
                 match (self.force_immediately, &core.params.restart_strategy) {
                     (true, _) | (false, &RestartStrategy::RestartImmediately) => {
-                        info!("restarting {} immediately after {}", core.params.name.as_ref(), self.source);
+                        info!("{} | restarting immediately after {}", core.params.name.as_ref(), self.source);
                         DoWantCloseFn::RestartNow {
                             next_state: StateWantAquireReq {
                                 init_state: state,
@@ -1002,7 +1002,7 @@ impl<FUC> StateWantCloseFn<FUC> {
                         }
                     },
                     (false, &RestartStrategy::Delay { restart_after, }) => {
-                        info!("restarting {} in {:?} after {}", core.params.name.as_ref(), restart_after, self.source);
+                        info!("{} | restarting in {:?} after {}", core.params.name.as_ref(), restart_after, self.source);
                         DoWantCloseFn::RestartWait {
                             next_state: StateWantAquireReqRestart {
                                 future: Delay::new(Instant::now() + restart_after),
@@ -1012,7 +1012,7 @@ impl<FUC> StateWantCloseFn<FUC> {
                     },
                 }
             Err(()) => {
-                error!("{} crashed with fatal error, terminating", self.source);
+                error!("{} | {} crashed with fatal error, terminating", core.params.name.as_ref(), self.source);
                 DoWantCloseFn::Fatal
             },
         }
@@ -1042,9 +1042,9 @@ impl<Q> StateWantReleaseReq<Q> {
            FCW: IntoFuture,
            N: AsRef<str>,
     {
-        debug!("State::WantReleaseReq | {}", core.params.name.as_ref());
+        debug!("{} | State::WantReleaseReq", core.params.name.as_ref());
         if core.aquires_count == 0 {
-            info!("{} runs out of resources, performing restart", core.params.name.as_ref());
+            info!("{} | run out of resources, performing restart", core.params.name.as_ref());
             return DoWantReleaseReq::Close {
                 next_state: StateWantCloseFn {
                     future: (core.close_wait_fn)(self.state_no_left).into_future(),
@@ -1061,7 +1061,7 @@ impl<Q> StateWantReleaseReq<Q> {
                 if release_req.generation == core.generation {
                     match release_req.status {
                         ResourceStatus::Reimburse(resource) => {
-                            debug!("release request (resource reimbursed)");
+                            debug!("{} | release request (resource reimbursed)", core.params.name.as_ref());
                             DoWantReleaseReq::Release {
                                 next_state: StateWantReleaseFn {
                                     future: (core.release_wait_fn)(self.state_no_left, Some(resource)).into_future(),
@@ -1070,7 +1070,7 @@ impl<Q> StateWantReleaseReq<Q> {
                             }
                         },
                         ResourceStatus::ResourceLost => {
-                            debug!("release request (resource lost)");
+                            debug!("{} | release request (resource lost)", core.params.name.as_ref());
                             DoWantReleaseReq::Release {
                                 next_state: StateWantReleaseFn {
                                     future: (core.release_wait_fn)(self.state_no_left, None).into_future(),
@@ -1079,7 +1079,7 @@ impl<Q> StateWantReleaseReq<Q> {
                             }
                         },
                         ResourceStatus::ResourceFault => {
-                            warn!("resource fault report: performing restart");
+                            warn!("{} | resource fault report: performing restart", core.params.name.as_ref());
                             DoWantReleaseReq::Close {
                                 next_state: StateWantCloseFn {
                                     future: (core.close_wait_fn)(self.state_no_left).into_future(),
@@ -1098,11 +1098,11 @@ impl<Q> StateWantReleaseReq<Q> {
                     DoWantReleaseReq::TryAgain { next_state: self, }
                 },
             Ok(Async::Ready(None)) => {
-                debug!("release channel depleted");
+                debug!("{} | release channel depleted", core.params.name.as_ref());
                 DoWantReleaseReq::Shutdown
             },
             Err(()) => {
-                debug!("release channel outer endpoint dropped");
+                debug!("{} | release channel outer endpoint dropped", core.params.name.as_ref());
                 DoWantReleaseReq::Shutdown
             },
         }
