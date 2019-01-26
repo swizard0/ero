@@ -1133,7 +1133,10 @@ impl<R> LodeResource<R> {
         StealResource { state: StealState::WantAquire { resource: self, }, }
     }
 
-    pub fn using_resource_loop<S, F, FI>(self, state: S, using_fn: F) -> UsingResourceLoop<R, S, F, FI> where FI: IntoFuture {
+    pub fn using_resource_loop<S, F, FI>(self, state: S, using_fn: F) -> UsingResourceLoop<R, S, F, FI>
+    where F: FnMut(R, S) -> FI,
+          FI: IntoFuture,
+    {
         UsingResourceLoop {
             using_fn,
             state: UsingState::WantAquire { resource: self, state, },
