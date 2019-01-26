@@ -1129,30 +1129,8 @@ pub enum UsingResource<R> {
 }
 
 impl<R> LodeResource<R> {
-    pub fn steal_resource(self) -> impl Future<Item = (R, LodeResource<R>), Error = ()> {
-        let LodeResource { aquire_tx, release_tx, } = self;
-        let (resource_tx, resource_rx) = oneshot::channel();
-        aquire_tx
-            .send(AquireReq { reply_tx: resource_tx, })
-            .map_err(|_send_error| {
-                warn!("resource task is gone while aquiring resource");
-            })
-            .and_then(move |aquire_tx| {
-                resource_rx
-                    .map_err(|oneshot::Canceled| {
-                        warn!("resouce task is gone while receiving aquired resource");
-                    })
-                    .and_then(move |ResourceGen { resource, generation, }| {
-                        release_tx
-                            .send(ReleaseReq { generation, status: ResourceStatus::ResourceLost, })
-                            .map_err(|_send_error| {
-                                warn!("resource task is gone while releasing resource");
-                            })
-                            .map(move |release_tx| {
-                                (resource, LodeResource { aquire_tx, release_tx, })
-                            })
-                    })
-            })
+    pub fn steal_resource(self) -> StealResource<R> {
+        StealResource { state: StealState::WantAquire { resource: self, }, }
     }
 
     pub fn using_resource_loop<S, F, FI>(self, state: S, using_fn: F) -> UsingResourceLoop<R, S, F, FI> where FI: IntoFuture {
@@ -1179,6 +1157,107 @@ impl<R> LodeResource<R> {
                     .map(|(using_resource, value)| (using_resource, Loop::Break(value)))
             },
         )
+    }
+}
+
+pub struct StealResource<R> {
+    state: StealState<R>,
+}
+
+enum StealState<R> {
+    Invalid,
+    WantAquire { resource: LodeResource<R>, },
+    WantAquireStartSend {
+        request: AquireReq<R>,
+        resource_rx: oneshot::Receiver<ResourceGen<R>>,
+        resource: LodeResource<R>,
+    },
+    WantAquirePollSend {
+        resource_rx: oneshot::Receiver<ResourceGen<R>>,
+        resource: LodeResource<R>,
+    },
+    WantResourceRecv {
+        resource_rx: oneshot::Receiver<ResourceGen<R>>,
+        resource: LodeResource<R>,
+    },
+}
+
+impl<R> Future for StealResource<R> {
+    type Item = (R, LodeResource<R>);
+    type Error = ();
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        loop {
+            match mem::replace(&mut self.state, StealState::Invalid) {
+                StealState::Invalid =>
+                    panic!("cannot poll StealResource twice"),
+
+                StealState::WantAquire { resource, } => {
+                    debug!("StealState::WantAquire");
+                    let (resource_tx, resource_rx) = oneshot::channel();
+                    self.state = StealState::WantAquireStartSend {
+                        request: AquireReq { reply_tx: resource_tx, },
+                        resource_rx,
+                        resource,
+                    };
+                },
+
+                StealState::WantAquireStartSend { request, resource_rx, mut resource, } => {
+                    debug!("StealState::WantAquireStartSend");
+                    match resource.aquire_tx.start_send(request) {
+                        Ok(AsyncSink::NotReady(request)) => {
+                            self.state = StealState::WantAquireStartSend { request, resource_rx, resource, };
+                            return Ok(Async::NotReady);
+                        },
+                        Ok(AsyncSink::Ready) =>
+                            self.state = StealState::WantAquirePollSend { resource_rx, resource, },
+                        Err(_send_error) => {
+                            warn!("resource task is gone during start_send while aquiring resource");
+                            return Err(());
+                        },
+                    }
+                },
+
+                StealState::WantAquirePollSend { resource_rx, mut resource, } => {
+                    debug!("StealState::WantAquirePollSend");
+                    match resource.aquire_tx.poll_complete() {
+                        Ok(Async::NotReady) => {
+                            self.state = StealState::WantAquirePollSend { resource_rx, resource, };
+                            return Ok(Async::NotReady);
+                        },
+                        Ok(Async::Ready(())) =>
+                            self.state = StealState::WantResourceRecv { resource_rx, resource, },
+                        Err(_send_error) => {
+                            warn!("resource task is gone during poll_complete while aquiring resource");
+                            return Err(());
+                        },
+                    }
+                },
+
+                StealState::WantResourceRecv { mut resource_rx, resource, } => {
+                    debug!("Steal::WantResourceRecv");
+                    match resource_rx.poll() {
+                        Ok(Async::NotReady) => {
+                            self.state = StealState::WantResourceRecv { resource_rx, resource, };
+                            return Ok(Async::NotReady);
+                        },
+                        Ok(Async::Ready(ResourceGen { resource: received_resource, generation, })) =>
+                            match resource.release_tx.unbounded_send(ReleaseReq { generation, status: ResourceStatus::ResourceLost, }) {
+                                Ok(()) =>
+                                    return Ok(Async::Ready((received_resource, resource))),
+                                Err(_send_error) => {
+                                    warn!("resource task is gone during send while releasing resource");
+                                    return Err(())
+                                }
+                            },
+                        Err(oneshot::Canceled) => {
+                            warn!("resource task is gone during poll while aquiring resource");
+                            return Err(());
+                        },
+                    }
+                },
+            }
+        }
     }
 }
 
