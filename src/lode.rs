@@ -6,11 +6,11 @@ use std::{
 use futures::{
     Poll,
     Async,
+    AsyncSink,
     sync::{
         mpsc,
         oneshot,
     },
-    future::loop_fn,
     Sink,
     Future,
     Stream,
@@ -1155,104 +1155,11 @@ impl<R> LodeResource<R> {
             })
     }
 
-    pub fn using_resource_loop<F, T, E, S, FI>(
-        self,
-        state: S,
-        using_fn: F,
-    )
-        -> impl Future<Item = (T, LodeResource<R>), Error = UsingError<E>>
-    where F: FnMut(R, S) -> FI,
-          FI: IntoFuture<Item = (UsingResource<R>, Loop<T, S>), Error = ErrorSeverity<S, E>>
-    {
-        loop_fn(
-            (self, using_fn, state),
-            move |(LodeResource { aquire_tx, release_tx, }, mut using_fn, state)| {
-                debug!("using_resource_loop: aquiring resource");
-                let (resource_tx, resource_rx) = oneshot::channel();
-                aquire_tx
-                    .send(AquireReq { reply_tx: resource_tx, })
-                    .map_err(|_send_error| {
-                        warn!("resource task is gone while aquiring resource");
-                        UsingError::ResourceTaskGone
-                    })
-                    .and_then(move |aquire_tx| {
-                        resource_rx
-                            .map_err(|oneshot::Canceled| {
-                                warn!("resouce task is gone while receiving aquired resource");
-                                UsingError::ResourceTaskGone
-                            })
-                            .and_then(move |ResourceGen { resource, generation, }| {
-                                debug!("using_resource_loop: resource aquired, passing control to user proc");
-                                using_fn(resource, state)
-                                    .into_future()
-                                    .then(move |using_result| {
-                                        match using_result {
-                                            Ok((maybe_resource, loop_action)) => {
-                                                debug!(
-                                                    "using_resource_loop: resource: {}, loop action: {}, releasing resource",
-                                                    match maybe_resource {
-                                                        UsingResource::Lost =>
-                                                            "lost",
-                                                        UsingResource::Reimburse(..) =>
-                                                            "reimbursed",
-                                                    },
-                                                    match loop_action {
-                                                        Loop::Break(..) =>
-                                                            "break",
-                                                        Loop::Continue(..) =>
-                                                            "continue",
-                                                    },
-                                                );
-                                                release_tx
-                                                    .unbounded_send(ReleaseReq {
-                                                        generation,
-                                                        status: match maybe_resource {
-                                                            UsingResource::Lost =>
-                                                                ResourceStatus::ResourceLost,
-                                                            UsingResource::Reimburse(resource) =>
-                                                                ResourceStatus::Reimburse(resource),
-                                                        },
-                                                    })
-                                                    .map_err(|_send_error| {
-                                                        warn!("resource task is gone while releasing resource");
-                                                        UsingError::ResourceTaskGone
-                                                    })
-                                                    .map(move |()| {
-                                                        let lode = LodeResource { aquire_tx, release_tx, };
-                                                        match loop_action {
-                                                            Loop::Break(item) =>
-                                                                Loop::Break((item, lode)),
-                                                            Loop::Continue(state) =>
-                                                                Loop::Continue((lode, using_fn, state)),
-                                                        }
-                                                    })
-                                            },
-                                            Err(error) => {
-                                                debug!("using_resource_loop: an error occurred, releasing resource");
-                                                release_tx
-                                                    .unbounded_send(ReleaseReq { generation, status: ResourceStatus::ResourceFault, })
-                                                    .map_err(|_send_error| {
-                                                        warn!("resource task is gone while releasing resource");
-                                                        UsingError::ResourceTaskGone
-                                                    })
-                                                    .and_then(move |()| {
-                                                        match error {
-                                                            ErrorSeverity::Recoverable { state, } =>
-                                                                Ok(Loop::Continue((
-                                                                    LodeResource { aquire_tx, release_tx, },
-                                                                    using_fn,
-                                                                    state,
-                                                                ))),
-                                                            ErrorSeverity::Fatal(fatal_error) =>
-                                                                Err(UsingError::Fatal(fatal_error)),
-                                                        }
-                                                    })
-                                            }
-                                        }
-                                    })
-                            })
-                    })
-            })
+    pub fn using_resource_loop<S, F, FI>(self, state: S, using_fn: F) -> UsingResourceLoop<R, S, F, FI> where FI: IntoFuture {
+        UsingResourceLoop {
+            using_fn,
+            state: UsingState::WantAquire { resource: self, state, },
+        }
     }
 
     pub fn using_resource_once<F, T, E, S, FI>(
@@ -1272,5 +1179,164 @@ impl<R> LodeResource<R> {
                     .map(|(using_resource, value)| (using_resource, Loop::Break(value)))
             },
         )
+    }
+}
+
+pub struct UsingResourceLoop<R, S, F, FI> where FI: IntoFuture {
+    using_fn: F,
+    state: UsingState<S, R, FI::Future>,
+}
+
+enum UsingState<S, R, FU> {
+    Invalid,
+    WantAquire { state: S, resource: LodeResource<R>, },
+    WantAquireStartSend {
+        request: AquireReq<R>,
+        resource_rx: oneshot::Receiver<ResourceGen<R>>,
+        state: S,
+        resource: LodeResource<R>,
+    },
+    WantAquirePollSend {
+        resource_rx: oneshot::Receiver<ResourceGen<R>>,
+        state: S,
+        resource: LodeResource<R>,
+    },
+    WantResourceRecv {
+        resource_rx: oneshot::Receiver<ResourceGen<R>>,
+        state: S,
+        resource: LodeResource<R>,
+    },
+    WantUserFn {
+        future: FU,
+        generation: Generation,
+        resource: LodeResource<R>,
+    },
+}
+
+impl<R, S, F, FI, T, E> Future for UsingResourceLoop<R, S, F, FI>
+where F: FnMut(R, S) -> FI,
+      FI: IntoFuture<Item = (UsingResource<R>, Loop<T, S>), Error = ErrorSeverity<S, E>>
+{
+    type Item = (T, LodeResource<R>);
+    type Error = UsingError<E>;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        loop {
+            match mem::replace(&mut self.state, UsingState::Invalid) {
+                UsingState::Invalid =>
+                    panic!("cannot poll UsingResourceLoop twice"),
+
+                UsingState::WantAquire { state, resource, } => {
+                    debug!("UsingState::WantAquire");
+                    let (resource_tx, resource_rx) = oneshot::channel();
+                    self.state = UsingState::WantAquireStartSend {
+                        request: AquireReq { reply_tx: resource_tx, },
+                        resource_rx,
+                        state,
+                        resource,
+                    };
+                },
+
+                UsingState::WantAquireStartSend { request, resource_rx, state, mut resource, } => {
+                    debug!("UsingState::WantAquireStartSend");
+                    match resource.aquire_tx.start_send(request) {
+                        Ok(AsyncSink::NotReady(request)) => {
+                            self.state = UsingState::WantAquireStartSend { request, resource_rx, state, resource, };
+                            return Ok(Async::NotReady);
+                        },
+                        Ok(AsyncSink::Ready) =>
+                            self.state = UsingState::WantAquirePollSend { resource_rx, state, resource, },
+                        Err(_send_error) => {
+                            warn!("resource task is gone during start_send while aquiring resource");
+                            return Err(UsingError::ResourceTaskGone);
+                        },
+                    }
+                },
+
+                UsingState::WantAquirePollSend { resource_rx, state, mut resource, } => {
+                    debug!("UsingState::WantAquirePollSend");
+                    match resource.aquire_tx.poll_complete() {
+                        Ok(Async::NotReady) => {
+                            self.state = UsingState::WantAquirePollSend { resource_rx, state, resource, };
+                            return Ok(Async::NotReady);
+                        },
+                        Ok(Async::Ready(())) =>
+                            self.state = UsingState::WantResourceRecv { resource_rx, state, resource, },
+                        Err(_send_error) => {
+                            warn!("resource task is gone during poll_complete while aquiring resource");
+                            return Err(UsingError::ResourceTaskGone);
+                        },
+                    }
+                },
+
+                UsingState::WantResourceRecv { mut resource_rx, state, resource, } => {
+                    debug!("UsingState::WantResourceRecv");
+                    match resource_rx.poll() {
+                        Ok(Async::NotReady) => {
+                            self.state = UsingState::WantResourceRecv { resource_rx, state, resource, };
+                            return Ok(Async::NotReady);
+                        },
+                        Ok(Async::Ready(ResourceGen { resource: received_resource, generation, })) =>
+                            self.state = UsingState::WantUserFn {
+                                future: (self.using_fn)(received_resource, state).into_future(),
+                                generation,
+                                resource,
+                            },
+                        Err(oneshot::Canceled) => {
+                            warn!("resource task is gone during poll while aquiring resource");
+                            return Err(UsingError::ResourceTaskGone);
+                        },
+                    }
+                },
+
+                UsingState::WantUserFn { mut future, generation, resource, } => {
+                    debug!("UsingState::WantUserFn");
+                    match future.poll() {
+                        Ok(Async::NotReady) => {
+                            self.state = UsingState::WantUserFn { future, generation, resource, };
+                            return Ok(Async::NotReady);
+                        },
+                        Ok(Async::Ready((maybe_resource, loop_action))) => {
+                            let release_req = ReleaseReq {
+                                generation,
+                                status: match maybe_resource {
+                                    UsingResource::Lost =>
+                                        ResourceStatus::ResourceLost,
+                                    UsingResource::Reimburse(resource) =>
+                                        ResourceStatus::Reimburse(resource),
+                                },
+                            };
+                            match resource.release_tx.unbounded_send(release_req) {
+                                Ok(()) =>
+                                    match loop_action {
+                                        Loop::Continue(state) =>
+                                            self.state = UsingState::WantAquire { state, resource, },
+                                        Loop::Break(value) =>
+                                            return Ok(Async::Ready((value, resource))),
+                                    },
+                                Err(_send_error) => {
+                                    warn!("resource task is gone during send while releasing resource");
+                                    return Err(UsingError::ResourceTaskGone)
+                                },
+                            }
+                        },
+                        Err(error) =>
+                            match resource.release_tx.unbounded_send(ReleaseReq { generation, status: ResourceStatus::ResourceFault, }) {
+                                Ok(()) =>
+                                    match error {
+                                        ErrorSeverity::Recoverable { state, } =>
+                                            self.state = UsingState::WantAquire { state, resource, },
+                                        ErrorSeverity::Fatal(fatal_error) =>
+                                            return Err(UsingError::Fatal(fatal_error)),
+                                    },
+                                Err(_send_error) => {
+                                    warn!("resource task is gone during send while releasing resource");
+                                    return Err(UsingError::ResourceTaskGone)
+                                }
+                            },
+                    }
+                },
+            }
+        }
     }
 }

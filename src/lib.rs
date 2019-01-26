@@ -1,5 +1,3 @@
-#![type_length_limit="33554432"]
-
 use std::time::Duration;
 
 pub use futures::{
