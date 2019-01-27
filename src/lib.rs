@@ -17,6 +17,7 @@ pub enum ErrorSeverity<S, A> {
 }
 
 pub enum RestartStrategy {
+    InstantCrash,
     RestartImmediately,
     Delay { restart_after: Duration, },
 }

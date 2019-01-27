@@ -517,6 +517,10 @@ impl<FUI, R> StateWantInitFn<FUI, R> {
             },
             Err(ErrorSeverity::Recoverable { state, }) =>
                 match core.params.restart_strategy {
+                    RestartStrategy::InstantCrash => {
+                        info!("{} | init_fn failed: forcing instant crash", core.params.name.as_ref());
+                        DoWantInitFn::Fatal
+                    },
                     RestartStrategy::RestartImmediately => {
                         info!("{} | init_fn failed: restarting immediately", core.params.name.as_ref());
                         DoWantInitFn::RestartNow {
@@ -654,6 +658,10 @@ impl<FUC, R> StateWantInitFnClose<FUC, R> {
                 DoWantInitFnClose::NotReady { next_state: self, },
             Ok(Async::Ready(state)) =>
                 match core.params.restart_strategy {
+                    RestartStrategy::InstantCrash => {
+                        info!("{} | forcing instant crash after close_wait_fn", core.params.name.as_ref());
+                        DoWantInitFnClose::Fatal
+                    },
                     RestartStrategy::RestartImmediately => {
                         info!("{} | restarting immediately after close_wait_fn", core.params.name.as_ref());
                         DoWantInitFnClose::RestartNow {
@@ -733,6 +741,10 @@ impl<FUA, R> StateWantAquireFn<FUA, R> {
             },
             Err(ErrorSeverity::Recoverable { state, }) =>
                 match core.params.restart_strategy {
+                    RestartStrategy::InstantCrash => {
+                        info!("{} | aquire_fn failed: forcing instant crash", core.params.name.as_ref());
+                        DoWantAquireFn::Fatal
+                    },
                     RestartStrategy::RestartImmediately => {
                         info!("{} | aquire_fn failed: restarting immediately", core.params.name.as_ref());
                         DoWantAquireFn::RestartNow {
@@ -937,6 +949,10 @@ impl<FUR> StateWantReleaseFn<FUR> {
             },
             Err(ErrorSeverity::Recoverable { state, }) =>
                 match core.params.restart_strategy {
+                    RestartStrategy::InstantCrash => {
+                        info!("{} | {} failed: forcing instant crash", core.params.name.as_ref(), self.source);
+                        DoWantReleaseFn::Fatal
+                    },
                     RestartStrategy::RestartImmediately => {
                         info!("{} | {} failed: restarting immediately", core.params.name.as_ref(), self.source);
                         DoWantReleaseFn::RestartNow {
@@ -1000,6 +1016,10 @@ impl<FUC> StateWantCloseFn<FUC> {
                                 init_state: state,
                             },
                         }
+                    },
+                    (false, &RestartStrategy::InstantCrash) => {
+                        info!("{} | failed: forcing instant crash after {}", core.params.name.as_ref(), self.source);
+                        DoWantCloseFn::Fatal
                     },
                     (false, &RestartStrategy::Delay { restart_after, }) => {
                         info!("{} | restarting in {:?} after {}", core.params.name.as_ref(), restart_after, self.source);

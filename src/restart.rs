@@ -25,12 +25,18 @@ use super::{
     RestartStrategy,
 };
 
+#[derive(Clone, PartialEq, Debug)]
+pub enum RestartableError<E> {
+    Fatal(E),
+    RestartCrashForced,
+}
+
 pub fn restartable<N, S, F, I, T, E>(
     params: Params<N>,
     state: S,
     mut restartable_fn: F,
 )
-    -> impl Future<Item = T, Error = E>
+    -> impl Future<Item = T, Error = RestartableError<E>>
 where F: FnMut(S) -> I,
       I: IntoFuture<Item = T, Error = ErrorSeverity<S, E>>,
       N: AsRef<str>,
@@ -47,6 +53,11 @@ where F: FnMut(S) -> I,
                     },
                     Err(ErrorSeverity::Recoverable { state, }) =>
                         match params.restart_strategy {
+                            RestartStrategy::InstantCrash => {
+                                info!("recoverable error in {} but current strategy is to crash", params.name.as_ref());
+                                let future = future::result(Err(RestartableError::RestartCrashForced));
+                                Either::A(future)
+                            },
                             RestartStrategy::RestartImmediately => {
                                 info!("recoverable error in {}, restarting immediately", params.name.as_ref());
                                 let future = future::result(Ok(Loop::Continue((params, state))));
@@ -66,7 +77,7 @@ where F: FnMut(S) -> I,
                         },
                     Err(ErrorSeverity::Fatal(error)) => {
                         debug!("{} fatal error", params.name.as_ref());
-                        let future = future::result(Err(error));
+                        let future = future::result(Err(RestartableError::Fatal(error)));
                         Either::A(future)
                     },
                 }
