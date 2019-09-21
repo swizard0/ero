@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use futures::{
     future::{
         result,
@@ -19,12 +21,52 @@ use log::{
     error,
 };
 
-use super::blend::{
-    Gone,
-    Blender,
-    ErrorEvent,
-    DecomposeZip,
+use super::{
+    supervisor,
+    blend::{
+        Gone,
+        Blender,
+        ErrorEvent,
+        DecomposeZip,
+    },
 };
+
+pub fn run_pool<MN, I, SN, S, M, H, F>(
+    supervisor: &supervisor::Supervisor,
+    master_name: MN,
+    slaves_iter: I,
+    handler: H,
+)
+    -> mpsc::Sender<M>
+where MN: AsRef<str> + Send + 'static,
+      SN: AsRef<str> + Send + 'static,
+      I: IntoIterator<Item = (SN, S)>,
+      S: Send + 'static,
+      M: Send + 'static,
+      H: Fn(M, S) -> F + Send + Sync + 'static,
+      F: IntoFuture<Item = S, Error = ()> + Send + 'static,
+      F::Future: Send,
+{
+    let (tasks_tx, tasks_rx) = mpsc::channel(1);
+    let (slaves_tx, slaves_rx) = mpsc::channel(1);
+
+    supervisor.spawn_link(run_master(master_name, tasks_rx, slaves_rx));
+
+    let shared_handler = Arc::new(handler);
+    for (slave_name, slave_state) in slaves_iter {
+        let handler = shared_handler.clone();
+        supervisor.spawn_link(
+            run_slave(
+                slave_name,
+                slave_state,
+                slaves_tx.clone(),
+                move |task, state| handler(task, state),
+            )
+        );
+    }
+
+    tasks_tx
+}
 
 pub fn run_master<N, M>(
     name: N,
@@ -130,10 +172,10 @@ pub fn run_slave<N, M, S, H, F>(
 )
     -> impl Future<Item = (), Error = ()>
 where N: AsRef<str>,
-      H: FnMut(M, S) -> F,
+      H: Fn(M, S) -> F,
       F: IntoFuture<Item = S, Error = ()>,
 {
-    loop_fn((name, slaves_tx, init_state, handler), |(name, slaves_tx, state, mut handler)| {
+    loop_fn((name, slaves_tx, init_state, handler), |(name, slaves_tx, state, handler)| {
         let (task_tx, task_rx) = oneshot::channel();
         slaves_tx
             .send(task_tx)
