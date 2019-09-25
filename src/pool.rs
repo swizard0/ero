@@ -72,14 +72,23 @@ use super::{
 //     tasks_tx
 // }
 
+#[derive(Debug)]
+pub enum MasterError {
+    TasksChannelDropped,
+    TasksChannelDepleted,
+    SlavesChannelDropped,
+    SlavesChannelDepleted,
+    CrashForced,
+}
+
 pub fn run_master<N, MT, ST, M>(
     params: Params<N>,
     tasks_rx: mpsc::Receiver<MT>,
     slaves_rx: mpsc::Receiver<oneshot::Sender<ST>>,
     converter: M,
 )
-    -> impl Future<Item = (), Error = ()>
-where N: AsRef<str> + Clone,
+    -> impl Future<Item = (), Error = MasterError>
+where N: AsRef<str>,
       M: Fn(MT) -> ST,
 {
     struct RestartableState<MT, ST, M> {
@@ -173,74 +182,122 @@ where N: AsRef<str> + Clone,
                         },
                         Err(Source::Task(ErrorEvent::Depleted {
                             decomposed: DecomposeZip { left_dir: (_slaves_rx, ()), myself: Gone, right_rev: (), },
-                        })) => {
-                            error!("unexpected tasks stream termination in master: shutting down");
-                            Err(ErrorSeverity::Fatal(()))
-                        },
+                        })) =>
+                            Err(ErrorSeverity::Fatal(MasterError::TasksChannelDepleted)),
                         Err(Source::Slave(ErrorEvent::Depleted {
                             decomposed: DecomposeZip { left_dir: (), myself: Gone, right_rev: (_tasks_rx, ()), },
-                        })) => {
-                            error!("unexpected slaves stream termination in master: shutting down");
-                            Err(ErrorSeverity::Fatal(()))
-                        },
+                        })) =>
+                            Err(ErrorSeverity::Fatal(MasterError::SlavesChannelDepleted)),
                         Err(Source::Task(ErrorEvent::Error {
                             error: (),
                             decomposed: DecomposeZip { left_dir: (_slaves_rx, ()), myself: Gone, right_rev: (), },
-                        })) => {
-                            error!("unexpected tasks stream drop in master: shutting down");
-                            Err(ErrorSeverity::Fatal(()))
-                        },
+                        })) =>
+                            Err(ErrorSeverity::Fatal(MasterError::TasksChannelDropped)),
                         Err(Source::Slave(ErrorEvent::Error {
                             error: (),
                             decomposed: DecomposeZip { left_dir: (), myself: Gone, right_rev: (_tasks_rx, ()), },
-                        })) => {
-                            error!("unexpected slaves stream drop in master: shutting down");
-                            Err(ErrorSeverity::Fatal(()))
-                        },
+                        })) =>
+                            Err(ErrorSeverity::Fatal(MasterError::SlavesChannelDropped)),
                     })
             })
         })
-        .map_err(|_restartable_error| ())
+        .map_err(|restartable_error| match restartable_error {
+            restart::RestartableError::Fatal(error) =>
+                error,
+            restart::RestartableError::RestartCrashForced =>
+                MasterError::CrashForced,
+        })
 }
 
-// pub fn run_slave<N, M, S, H, F>(
-//     name: N,
-//     init_state: S,
-//     slaves_tx: mpsc::Sender<oneshot::Sender<M>>,
-//     handler: H,
-// )
-//     -> impl Future<Item = (), Error = ()>
-// where N: AsRef<str>,
-//       H: Fn(M, S) -> F,
-//       F: IntoFuture<Item = S, Error = ()>,
-// {
-//     loop_fn((name, slaves_tx, init_state, handler), |(name, slaves_tx, state, handler)| {
-//         let (task_tx, task_rx) = oneshot::channel();
-//         slaves_tx
-//             .send(task_tx)
-//             .then(move |send_result| match send_result {
-//                 Ok(slaves_tx) => {
-//                     let future = task_rx
-//                         .then(move |recv_result| match recv_result {
-//                             Ok(task) => {
-//                                 let future = handler(task, state)
-//                                     .into_future()
-//                                     .map(move |state| {
-//                                         Loop::Continue((name, slaves_tx, state, handler))
-//                                     });
-//                                 Either::A(future)
-//                             },
-//                             Err(oneshot::Canceled) => {
-//                                 warn!("broken message channel in slave {}", name.as_ref());
-//                                 Either::B(result(Err(())))
-//                             },
-//                         });
-//                     Either::A(future)
-//                 },
-//                 Err(_send_error) => {
-//                     warn!("unexpected master stream disconnect in slave {}, terminating", name.as_ref());
-//                     Either::B(result(Err(())))
-//                 },
-//             })
-//     })
-// }
+#[derive(Debug)]
+pub enum SlaveError<EB, EH> {
+    Bootstrap(EB),
+    Handler(EH),
+    MasterChannelDropped,
+    TasksChannelDropped,
+    CrashForced,
+}
+
+pub fn run_slave<N, B, EB, FB, S, M, H, EH, FH>(
+    params: Params<N>,
+    init_state: S,
+    bootstrap: B,
+    slaves_tx: mpsc::Sender<oneshot::Sender<M>>,
+    handler: H,
+)
+    -> impl Future<Item = (), Error = SlaveError<EB, EH>>
+where N: AsRef<str>,
+      B: Fn(S) -> FB,
+      FB: IntoFuture<Item = S, Error = ErrorSeverity<S, EB>>,
+      H: Fn(M, S) -> FH,
+      FH: IntoFuture<Item = S, Error = ErrorSeverity<S, EH>>,
+{
+    struct State<S, B, M, H> {
+        state: S,
+        bootstrap: B,
+        slaves_tx: mpsc::Sender<oneshot::Sender<M>>,
+        handler: H,
+    }
+
+    restart::restartable(
+        params,
+        State {
+            state: init_state,
+            bootstrap,
+            slaves_tx,
+            handler,
+        },
+        |State { state: init_state, bootstrap, slaves_tx, handler }| {
+            bootstrap(init_state)
+                .into_future()
+                .then(move |bootstrap_result| match bootstrap_result {
+                    Ok(state) => {
+                        let future = loop_fn(State {state, bootstrap, slaves_tx, handler, }, |State { state, bootstrap, slaves_tx, handler, }| {
+                            let (task_tx, task_rx) = oneshot::channel();
+                            slaves_tx
+                                .send(task_tx)
+                                .then(move |send_result| match send_result {
+                                    Ok(slaves_tx) => {
+                                        let future = task_rx
+                                            .then(move |recv_result| match recv_result {
+                                                Ok(task) => {
+                                                    let future = handler(task, state)
+                                                        .into_future()
+                                                        .then(move |handler_result| match handler_result {
+                                                            Ok(state) =>
+                                                                Ok(Loop::Continue(State { state, bootstrap, slaves_tx, handler, })),
+                                                            Err(ErrorSeverity::Fatal(error)) =>
+                                                                Err(ErrorSeverity::Fatal(SlaveError::Handler(error))),
+                                                            Err(ErrorSeverity::Recoverable { state, }) =>
+                                                                Err(ErrorSeverity::Recoverable {
+                                                                    state: State { state, bootstrap, slaves_tx, handler, },
+                                                                }),
+                                                        });
+                                                    Either::A(future)
+                                                },
+                                                Err(oneshot::Canceled) =>
+                                                    Either::B(result(Err(ErrorSeverity::Fatal(SlaveError::TasksChannelDropped)))),
+                                            });
+                                        Either::A(future)
+                                    },
+                                    Err(_send_error) =>
+                                        Either::B(result(Err(ErrorSeverity::Fatal(SlaveError::MasterChannelDropped)))),
+                                })
+                        });
+                        Either::A(future)
+                    },
+                    Err(ErrorSeverity::Fatal(error)) =>
+                        Either::B(result(Err(ErrorSeverity::Fatal(SlaveError::Bootstrap(error))))),
+                    Err(ErrorSeverity::Recoverable { state, }) =>
+                        Either::B(result(Err(ErrorSeverity::Recoverable {
+                            state: State { state, bootstrap, slaves_tx, handler, },
+                        }))),
+                })
+        })
+        .map_err(|restartable_error| match restartable_error {
+            restart::RestartableError::Fatal(error) =>
+                error,
+            restart::RestartableError::RestartCrashForced =>
+                SlaveError::CrashForced,
+        })
+}
