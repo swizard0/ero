@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    fmt::Debug,
+};
 
 use futures::{
     future::{
@@ -17,7 +20,7 @@ use futures::{
 };
 
 use log::{
-    warn,
+    info,
     error,
 };
 
@@ -35,42 +38,84 @@ use super::{
     ErrorSeverity,
 };
 
-// pub fn run_pool<MN, I, SN, S, M, H, F>(
-//     supervisor: &supervisor::Supervisor,
-//     master_name: MN,
-//     slaves_iter: I,
-//     handler: H,
-// )
-//     -> mpsc::Sender<M>
-// where MN: AsRef<str> + Send + 'static,
-//       SN: AsRef<str> + Send + 'static,
-//       I: IntoIterator<Item = (SN, S)>,
-//       S: Send + 'static,
-//       M: Send + 'static,
-//       H: Fn(M, S) -> F + Send + Sync + 'static,
-//       F: IntoFuture<Item = S, Error = ()> + Send + 'static,
-//       F::Future: Send,
-// {
-//     let (tasks_tx, tasks_rx) = mpsc::channel(1);
-//     let (slaves_tx, slaves_rx) = mpsc::channel(1);
+pub fn spawn_pool<MN, SN, B, FB, EB, S, H, FH, EH, M, MT, ST, I>(
+    supervisor: &supervisor::Supervisor,
+    master_params: Params<MN>,
+    master_converter: M,
+    slaves_bootstrap: B,
+    slaves_handler: H,
+    slaves_iter: I,
+)
+    -> mpsc::Sender<MT>
+where MN: AsRef<str> + Send + 'static,
+      SN: AsRef<str> + Send + 'static,
+      M: Fn(MT) -> ST + Send + 'static,
+      MT: Send + 'static,
+      ST: Send + 'static,
+      B: Fn(S) -> FB + Sync + Send + 'static,
+      FB: IntoFuture<Item = S, Error = ErrorSeverity<S, EB>> + 'static,
+      FB::Future: Send,
+      EB: Debug + Send + 'static,
+      S: Send + 'static,
+      H: Fn(ST, S) -> FH + Sync + Send + 'static,
+      FH: IntoFuture<Item = S, Error = ErrorSeverity<S, EH>> + 'static,
+      FH::Future: Send,
+      EH: Debug + Send + 'static,
+      I: IntoIterator<Item = (Params<SN>, S)>,
+{
+    let (tasks_tx, tasks_rx) = mpsc::channel(1);
+    let (slaves_tx, slaves_rx) = mpsc::channel(1);
 
-//     supervisor.spawn_link(run_master(master_name, tasks_rx, slaves_rx));
+    supervisor.spawn_link(
+        run_master(
+            master_params,
+            tasks_rx,
+            slaves_rx,
+            master_converter,
+        ).map_err(|error| match error {
+            MasterError::TasksChannelDropped =>
+                error!("tasks channel dropped in master"),
+            MasterError::TasksChannelDepleted =>
+                info!("tasks channel depleted in master"),
+            MasterError::SlavesChannelDropped =>
+                error!("slaves channel dropped in master"),
+            MasterError::SlavesChannelDepleted =>
+                info!("slaves channel depleted in master"),
+            MasterError::CrashForced =>
+                info!("crash forced after error in master"),
+        })
+    );
 
-//     let shared_handler = Arc::new(handler);
-//     for (slave_name, slave_state) in slaves_iter {
-//         let handler = shared_handler.clone();
-//         supervisor.spawn_link(
-//             run_slave(
-//                 slave_name,
-//                 slave_state,
-//                 slaves_tx.clone(),
-//                 move |task, state| handler(task, state),
-//             )
-//         );
-//     }
+    let shared_bootstrap = Arc::new(slaves_bootstrap);
+    let shared_handler = Arc::new(slaves_handler);
 
-//     tasks_tx
-// }
+    for (params, init_state) in slaves_iter {
+        let bootstrap = shared_bootstrap.clone();
+        let handler = shared_handler.clone();
+        supervisor.spawn_link(
+            run_slave(
+                params,
+                init_state,
+                move |state| bootstrap(state),
+                slaves_tx.clone(),
+                move |task, state| handler(task, state),
+            ).map_err(|error| match error {
+                SlaveError::Bootstrap(error) =>
+                    error!("state bootstrap error in slave: {:?}", error),
+                SlaveError::Handler(error) =>
+                    error!("task handler error in slave: {:?}", error),
+                SlaveError::MasterChannelDropped =>
+                    error!("master channel dropped in slave"),
+                SlaveError::TasksChannelDropped =>
+                    error!("tasks channel dropped in slave"),
+                SlaveError::CrashForced =>
+                    info!("crash forced after error in slave"),
+            }),
+        );
+    }
+
+    tasks_tx
+}
 
 #[derive(Debug)]
 pub enum MasterError {
@@ -218,24 +263,24 @@ pub enum SlaveError<EB, EH> {
     CrashForced,
 }
 
-pub fn run_slave<N, B, EB, FB, S, M, H, EH, FH>(
+pub fn run_slave<N, B, EB, FB, S, T, H, EH, FH>(
     params: Params<N>,
     init_state: S,
     bootstrap: B,
-    slaves_tx: mpsc::Sender<oneshot::Sender<M>>,
+    slaves_tx: mpsc::Sender<oneshot::Sender<T>>,
     handler: H,
 )
     -> impl Future<Item = (), Error = SlaveError<EB, EH>>
 where N: AsRef<str>,
       B: Fn(S) -> FB,
       FB: IntoFuture<Item = S, Error = ErrorSeverity<S, EB>>,
-      H: Fn(M, S) -> FH,
+      H: Fn(T, S) -> FH,
       FH: IntoFuture<Item = S, Error = ErrorSeverity<S, EH>>,
 {
-    struct State<S, B, M, H> {
+    struct State<S, B, T, H> {
         state: S,
         bootstrap: B,
-        slaves_tx: mpsc::Sender<oneshot::Sender<M>>,
+        slaves_tx: mpsc::Sender<oneshot::Sender<T>>,
         handler: H,
     }
 
