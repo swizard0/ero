@@ -38,7 +38,7 @@ use super::{
     ErrorSeverity,
 };
 
-pub fn spawn_pool<MN, SN, B, FB, EB, S, H, FH, EH, M, MT, ST, I>(
+pub fn spawn_pool<MN, SN, B, FB, EB, BS, S, H, FH, EH, M, MT, ST, I>(
     supervisor: &supervisor::Supervisor,
     master_params: Params<MN>,
     master_converter: M,
@@ -52,16 +52,17 @@ where MN: AsRef<str> + Send + 'static,
       M: Fn(MT) -> ST + Send + 'static,
       MT: Send + 'static,
       ST: Send + 'static,
-      B: Fn(S) -> FB + Sync + Send + 'static,
-      FB: IntoFuture<Item = S, Error = ErrorSeverity<S, EB>> + 'static,
+      B: Fn(BS) -> FB + Sync + Send + 'static,
+      FB: IntoFuture<Item = S, Error = ErrorSeverity<BS, EB>> + 'static,
       FB::Future: Send,
       EB: Debug + Send + 'static,
       S: Send + 'static,
+      BS: Send + 'static,
       H: Fn(ST, S) -> FH + Sync + Send + 'static,
-      FH: IntoFuture<Item = S, Error = ErrorSeverity<S, EH>> + 'static,
+      FH: IntoFuture<Item = S, Error = ErrorSeverity<BS, EH>> + 'static,
       FH::Future: Send,
       EH: Debug + Send + 'static,
-      I: IntoIterator<Item = (Params<SN>, S)>,
+      I: IntoIterator<Item = (Params<SN>, BS)>,
 {
     let (tasks_tx, tasks_rx) = mpsc::channel(1);
     let (slaves_tx, slaves_rx) = mpsc::channel(1);
@@ -263,19 +264,19 @@ pub enum SlaveError<EB, EH> {
     CrashForced,
 }
 
-pub fn run_slave<N, B, EB, FB, S, T, H, EH, FH>(
+pub fn run_slave<N, B, EB, FB, BS, S, T, H, EH, FH>(
     params: Params<N>,
-    init_state: S,
+    init_state: BS,
     bootstrap: B,
     slaves_tx: mpsc::Sender<oneshot::Sender<T>>,
     handler: H,
 )
     -> impl Future<Item = (), Error = SlaveError<EB, EH>>
 where N: AsRef<str>,
-      B: Fn(S) -> FB,
-      FB: IntoFuture<Item = S, Error = ErrorSeverity<S, EB>>,
+      B: Fn(BS) -> FB,
+      FB: IntoFuture<Item = S, Error = ErrorSeverity<BS, EB>>,
       H: Fn(T, S) -> FH,
-      FH: IntoFuture<Item = S, Error = ErrorSeverity<S, EH>>,
+      FH: IntoFuture<Item = S, Error = ErrorSeverity<BS, EH>>,
 {
     struct State<S, B, T, H> {
         state: S,
