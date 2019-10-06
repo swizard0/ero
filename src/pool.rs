@@ -1,4 +1,5 @@
 use std::{
+    mem,
     sync::Arc,
     fmt::Debug,
 };
@@ -17,9 +18,13 @@ use futures::{
         oneshot,
     },
     Sink,
+    Poll,
+    Async,
+    AsyncSink,
 };
 
 use log::{
+    debug,
     info,
     error,
 };
@@ -329,67 +334,18 @@ where N: AsRef<str>,
       H: Fn(T, S) -> FH,
       FH: IntoFuture<Item = S, Error = ErrorSeverity<BS, EH>>,
 {
-    struct State<S, B, T, H> {
-        state: S,
-        bootstrap: B,
-        slaves_tx: mpsc::Sender<oneshot::Sender<T>>,
-        handler: H,
-    }
-
     restart::restartable(
         params,
-        State {
-            state: init_state,
-            bootstrap,
-            slaves_tx,
-            handler,
-        },
-        |State { state: init_state, bootstrap, slaves_tx, handler }| {
-            bootstrap(init_state)
-                .into_future()
-                .then(move |bootstrap_result| match bootstrap_result {
-                    Ok(state) => {
-                        let future = loop_fn(State {state, bootstrap, slaves_tx, handler, }, |State { state, bootstrap, slaves_tx, handler, }| {
-                            let (task_tx, task_rx) = oneshot::channel();
-                            slaves_tx
-                                .send(task_tx)
-                                .then(move |send_result| match send_result {
-                                    Ok(slaves_tx) => {
-                                        let future = task_rx
-                                            .then(move |recv_result| match recv_result {
-                                                Ok(task) => {
-                                                    let future = handler(task, state)
-                                                        .into_future()
-                                                        .then(move |handler_result| match handler_result {
-                                                            Ok(state) =>
-                                                                Ok(Loop::Continue(State { state, bootstrap, slaves_tx, handler, })),
-                                                            Err(ErrorSeverity::Fatal(error)) =>
-                                                                Err(ErrorSeverity::Fatal(SlaveError::Handler(error))),
-                                                            Err(ErrorSeverity::Recoverable { state, }) =>
-                                                                Err(ErrorSeverity::Recoverable {
-                                                                    state: State { state, bootstrap, slaves_tx, handler, },
-                                                                }),
-                                                        });
-                                                    Either::A(future)
-                                                },
-                                                Err(oneshot::Canceled) =>
-                                                    Either::B(result(Err(ErrorSeverity::Fatal(SlaveError::TasksChannelDropped)))),
-                                            });
-                                        Either::A(future)
-                                    },
-                                    Err(_send_error) =>
-                                        Either::B(result(Err(ErrorSeverity::Fatal(SlaveError::MasterChannelDropped)))),
-                                })
-                        });
-                        Either::A(future)
-                    },
-                    Err(ErrorSeverity::Fatal(error)) =>
-                        Either::B(result(Err(ErrorSeverity::Fatal(SlaveError::Bootstrap(error))))),
-                    Err(ErrorSeverity::Recoverable { state, }) =>
-                        Either::B(result(Err(ErrorSeverity::Recoverable {
-                            state: State { state, bootstrap, slaves_tx, handler, },
-                        }))),
-                })
+        SlaveState { init_state, bootstrap, slaves_tx, handler, },
+        |state| SlaveFuture {
+            mode: SlaveMode::Bootstrap {
+                ctx: SlaveContext {
+                    bootstrap: state.bootstrap,
+                    handler: state.handler,
+                    slaves_tx: state.slaves_tx,
+                },
+                init_state: state.init_state,
+            },
         })
         .map_err(|restartable_error| match restartable_error {
             restart::RestartableError::Fatal(error) =>
@@ -397,4 +353,165 @@ where N: AsRef<str>,
             restart::RestartableError::RestartCrashForced =>
                 SlaveError::CrashForced,
         })
+}
+
+struct SlaveState<S, B, T, H> {
+    init_state: S,
+    bootstrap: B,
+    slaves_tx: mpsc::Sender<oneshot::Sender<T>>,
+    handler: H,
+}
+
+struct SlaveFuture<BS, S, B, FFB, T, H, FFH> {
+    mode: SlaveMode<BS, S, B, FFB, T, H, FFH>,
+}
+
+struct SlaveContext<B, H, T> {
+    bootstrap: B,
+    handler: H,
+    slaves_tx: mpsc::Sender<oneshot::Sender<T>>,
+}
+
+enum SlaveMode<BS, S, B, FFB, T, H, FFH> {
+    Invalid,
+    Bootstrap { ctx: SlaveContext<B, H, T>, init_state: BS, },
+    BootstrapWait { ctx: SlaveContext<B, H, T>, future: FFB, },
+    SlaveStartSend {
+        ctx: SlaveContext<B, H, T>,
+        state: S,
+        task_tx: oneshot::Sender<T>,
+        task_rx: oneshot::Receiver<T>,
+    },
+    SlavePollSend {
+        ctx: SlaveContext<B, H, T>,
+        state: S,
+        task_rx: oneshot::Receiver<T>,
+    },
+    TaskRecv {
+        ctx: SlaveContext<B, H, T>,
+        state: S,
+        task_rx: oneshot::Receiver<T>,
+    },
+    HandlerWait { ctx: SlaveContext<B, H, T>, future: FFH, },
+}
+
+impl<BS, S, B, FB, EB, T, H, FH, EH> Future for SlaveFuture<BS, S, B, FB::Future, T, H, FH::Future>
+where B: Fn(BS) -> FB,
+      FB: IntoFuture<Item = S, Error = ErrorSeverity<BS, EB>>,
+      H: Fn(T, S) -> FH,
+      FH: IntoFuture<Item = S, Error = ErrorSeverity<BS, EH>>,
+{
+    type Item = ();
+    type Error = ErrorSeverity<SlaveState<BS, B, T, H>, SlaveError<EB, EH>>;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        loop {
+            match mem::replace(&mut self.mode, SlaveMode::Invalid) {
+                SlaveMode::Invalid =>
+                    panic!("cannot poll SlaveFuture twice"),
+
+                SlaveMode::Bootstrap { ctx, init_state, } => {
+                    debug!("SlaveMode::Bootstrap");
+                    let future = (ctx.bootstrap)(init_state)
+                        .into_future();
+                    self.mode = SlaveMode::BootstrapWait { ctx, future, };
+                },
+
+                SlaveMode::BootstrapWait { ctx, mut future, } => {
+                    debug!("SlaveMode::BootstrapWait");
+                    match future.poll() {
+                        Ok(Async::NotReady) => {
+                            self.mode = SlaveMode::BootstrapWait { ctx, future, };
+                            return Ok(Async::NotReady);
+                        },
+                        Ok(Async::Ready(state)) => {
+                            let (task_tx, task_rx) = oneshot::channel();
+                            self.mode = SlaveMode::SlaveStartSend { ctx, state, task_tx, task_rx, };
+                        },
+                        Err(ErrorSeverity::Recoverable { state, }) =>
+                            return Err(ErrorSeverity::Recoverable {
+                                state: SlaveState {
+                                    init_state: state,
+                                    bootstrap: ctx.bootstrap,
+                                    slaves_tx: ctx.slaves_tx,
+                                    handler: ctx.handler,
+                                },
+                            }),
+                        Err(ErrorSeverity::Fatal(error)) =>
+                            return Err(ErrorSeverity::Fatal(SlaveError::Bootstrap(error))),
+                    }
+                },
+
+                SlaveMode::SlaveStartSend { mut ctx, state, task_tx, task_rx, } => {
+                    debug!("SlaveMode::SlaveStartSend");
+                    match ctx.slaves_tx.start_send(task_tx) {
+                        Ok(AsyncSink::NotReady(task_tx)) => {
+                            self.mode = SlaveMode::SlaveStartSend { ctx, state, task_tx, task_rx, };
+                            return Ok(Async::NotReady);
+                        },
+                        Ok(AsyncSink::Ready) =>
+                            self.mode = SlaveMode::SlavePollSend { ctx, state, task_rx, },
+                        Err(_send_error) =>
+                            return Err(ErrorSeverity::Fatal(SlaveError::MasterChannelDropped)),
+                    }
+                },
+
+                SlaveMode::SlavePollSend { mut ctx, state, task_rx, } => {
+                    debug!("SlaveMode::SlavePollSend");
+                    match ctx.slaves_tx.poll_complete() {
+                        Ok(Async::NotReady) => {
+                            self.mode = SlaveMode::SlavePollSend { ctx, state, task_rx, };
+                            return Ok(Async::NotReady);
+                        },
+                        Ok(Async::Ready(())) =>
+                            self.mode = SlaveMode::TaskRecv { ctx, state, task_rx, },
+                        Err(_poll_error) =>
+                            return Err(ErrorSeverity::Fatal(SlaveError::MasterChannelDropped)),
+                    }
+                },
+
+                SlaveMode::TaskRecv { ctx, state, mut task_rx, } => {
+                    debug!("SlaveMode::TaskRecv");
+                    match task_rx.poll() {
+                        Ok(Async::NotReady) => {
+                            self.mode = SlaveMode::TaskRecv { ctx, state, task_rx, };
+                            return Ok(Async::NotReady);
+                        },
+                        Ok(Async::Ready(task)) => {
+                            let future = (ctx.handler)(task, state)
+                                .into_future();
+                            self.mode = SlaveMode::HandlerWait { ctx, future, };
+                        },
+                        Err(oneshot::Canceled) =>
+                            return Err(ErrorSeverity::Fatal(SlaveError::TasksChannelDropped)),
+                    }
+                },
+
+                SlaveMode::HandlerWait { ctx, mut future, } => {
+                    debug!("SlaveMode::HandlerWait");
+                    match future.poll() {
+                        Ok(Async::NotReady) => {
+                            self.mode = SlaveMode::HandlerWait { ctx, future, };
+                            return Ok(Async::NotReady);
+                        },
+                        Ok(Async::Ready(state)) => {
+                            let (task_tx, task_rx) = oneshot::channel();
+                            self.mode = SlaveMode::SlaveStartSend { ctx, state, task_tx, task_rx, };
+                        },
+                        Err(ErrorSeverity::Recoverable { state, }) =>
+                            return Err(ErrorSeverity::Recoverable {
+                                state: SlaveState {
+                                    init_state: state,
+                                    bootstrap: ctx.bootstrap,
+                                    slaves_tx: ctx.slaves_tx,
+                                    handler: ctx.handler,
+                                },
+                            }),
+                        Err(ErrorSeverity::Fatal(error)) =>
+                            return Err(ErrorSeverity::Fatal(SlaveError::Handler(error))),
+                    }
+                },
+            }
+        }
+    }
 }
