@@ -162,6 +162,7 @@ where N: AsRef<str>,
       BS: Send + 'static,
       B: Fn(BS) -> FB + Send + 'static,
       FB: IntoFuture<Item = S, Error = ErrorSeverity<BS, EB>>,
+      FB::Future: Send + 'static,
       EB: Send + 'static,
       C: Fn(MT, S) -> FC + Send + 'static,
       FC: IntoFuture<Item = (ST, S), Error = ErrorSeverity<BS, EC>>,
@@ -189,8 +190,12 @@ where N: AsRef<str>,
             converter,
         },
         |RestartableState { state: init_state, bootstrap, tasks_rx, slaves_rx, converter, }| {
-            bootstrap(init_state)
-                .into_future()
+            let bootstrapped: Box<dyn Future<Item = _, Error = _> + Send + 'static> =
+                Box::new(
+                    bootstrap(init_state)
+                        .into_future()
+                );
+            bootstrapped
                 .then(move |bootstrap_result| match bootstrap_result {
                     Ok(state) => {
                         enum Source<A, B> {
@@ -334,6 +339,7 @@ where N: AsRef<str>,
       BS: Send + 'static,
       B: Fn(BS) -> FB + Send + 'static,
       FB: IntoFuture<Item = S, Error = ErrorSeverity<BS, EB>>,
+      FB::Future: Send + 'static,
       EB: Send + 'static,
       H: Fn(T, S) -> FH + Send + 'static,
       FH: IntoFuture<Item = S, Error = ErrorSeverity<BS, EH>>,
@@ -358,8 +364,12 @@ where N: AsRef<str>,
             handler,
         },
         |State { state: init_state, bootstrap, slaves_tx, handler }| {
-            bootstrap(init_state)
-                .into_future()
+            let bootstrapped: Box<dyn Future<Item = _, Error = _> + Send + 'static> =
+                Box::new(
+                    bootstrap(init_state)
+                        .into_future()
+                );
+            bootstrapped
                 .then(move |bootstrap_result| match bootstrap_result {
                     Ok(state) => {
                         let future = loop_fn(State {state, bootstrap, slaves_tx, handler, }, |State { state, bootstrap, slaves_tx, handler, }| {
