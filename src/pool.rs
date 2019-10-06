@@ -159,10 +159,17 @@ pub fn run_master<N, B, FB, EB, BS, C, FC, EC, S, MT, ST>(
 )
     -> impl Future<Item = (), Error = MasterError<EB, EC>>
 where N: AsRef<str>,
-      B: Fn(BS) -> FB,
+      BS: Send + 'static,
+      B: Fn(BS) -> FB + Send + 'static,
       FB: IntoFuture<Item = S, Error = ErrorSeverity<BS, EB>>,
-      C: Fn(MT, S) -> FC,
+      EB: Send + 'static,
+      C: Fn(MT, S) -> FC + Send + 'static,
       FC: IntoFuture<Item = (ST, S), Error = ErrorSeverity<BS, EC>>,
+      FC::Future: Send + 'static,
+      EC: Send + 'static,
+      S: Send + 'static,
+      MT: Send + 'static,
+      ST: Send + 'static,
 {
     struct RestartableState<BS, B, MT, ST, C> {
         state: BS,
@@ -288,12 +295,12 @@ where N: AsRef<str>,
                                         Either::B(result(Err(ErrorSeverity::Fatal(MasterError::SlavesChannelDropped)))),
                                 })
                         });
-                        Either::A(future)
+                        Box::new(future) as Box<dyn Future<Item = _, Error = _> + Send + 'static>
                     },
                     Err(ErrorSeverity::Fatal(error)) =>
-                        Either::B(result(Err(ErrorSeverity::Fatal(MasterError::Bootstrap(error))))),
+                        Box::new(result(Err(ErrorSeverity::Fatal(MasterError::Bootstrap(error))))),
                     Err(ErrorSeverity::Recoverable { state, }) =>
-                        Either::B(result(Err(ErrorSeverity::Recoverable {
+                        Box::new(result(Err(ErrorSeverity::Recoverable {
                             state: RestartableState { state, bootstrap, tasks_rx, slaves_rx, converter, },
                         }))),
                 })
@@ -324,10 +331,16 @@ pub fn run_slave<N, B, EB, FB, BS, S, T, H, EH, FH>(
 )
     -> impl Future<Item = (), Error = SlaveError<EB, EH>>
 where N: AsRef<str>,
-      B: Fn(BS) -> FB,
+      BS: Send + 'static,
+      B: Fn(BS) -> FB + Send + 'static,
       FB: IntoFuture<Item = S, Error = ErrorSeverity<BS, EB>>,
-      H: Fn(T, S) -> FH,
+      EB: Send + 'static,
+      H: Fn(T, S) -> FH + Send + 'static,
       FH: IntoFuture<Item = S, Error = ErrorSeverity<BS, EH>>,
+      FH::Future: Send + 'static,
+      EH: Send + 'static,
+      S: Send + 'static,
+      T: Send + 'static,
 {
     struct State<S, B, T, H> {
         state: S,
@@ -381,12 +394,12 @@ where N: AsRef<str>,
                                         Either::B(result(Err(ErrorSeverity::Fatal(SlaveError::MasterChannelDropped)))),
                                 })
                         });
-                        Either::A(future)
+                        Box::new(future) as Box<dyn Future<Item = _, Error = _> + Send + 'static>
                     },
                     Err(ErrorSeverity::Fatal(error)) =>
-                        Either::B(result(Err(ErrorSeverity::Fatal(SlaveError::Bootstrap(error))))),
+                        Box::new(result(Err(ErrorSeverity::Fatal(SlaveError::Bootstrap(error))))),
                     Err(ErrorSeverity::Recoverable { state, }) =>
-                        Either::B(result(Err(ErrorSeverity::Recoverable {
+                        Box::new(result(Err(ErrorSeverity::Recoverable {
                             state: State { state, bootstrap, slaves_tx, handler, },
                         }))),
                 })
