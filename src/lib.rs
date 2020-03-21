@@ -1,16 +1,12 @@
 use std::time::Duration;
 
-pub use futures::{
-    future::Loop,
-    sync::oneshot,
-};
-
-pub mod supervisor;
+// pub mod supervisor;
 pub mod restart;
-pub mod blend;
-pub mod lode;
-pub mod pool;
-pub mod net;
+// pub mod blend;
+// pub mod lode;
+// pub mod pool;
+// pub mod net;
+mod macros;
 
 pub enum ErrorSeverity<S, A> {
     Fatal(A),
@@ -22,6 +18,8 @@ pub enum RestartStrategy {
     RestartImmediately,
     Delay { restart_after: Duration, },
 }
+
+pub struct Terminate<R>(pub R);
 
 pub struct Params<N> {
     pub name: N,
