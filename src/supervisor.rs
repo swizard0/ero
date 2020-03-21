@@ -43,7 +43,6 @@ impl Supervisor {
 
     pub fn with_runtime_handle(runtime_handle: Handle) -> (Supervisor, Init) {
         let (notify_tx, notify_rx) = mpsc::channel(0);
-
         (
             Supervisor {
                 current_pid: ProcessId::default(),
