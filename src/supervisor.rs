@@ -54,6 +54,10 @@ impl Supervisor {
         )
     }
 
+    pub fn runtime_handle(&self) -> &Handle {
+        &self.runtime_handle
+    }
+
     pub fn spawn_link_permanent<F>(&mut self, future: F) where F: Future<Output = ()> + Send + 'static {
         self.spawn_link(future, |pid| Event::PermanentProcessExited { pid, })
     }
