@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-// pub mod supervisor;
+pub mod supervisor;
 pub mod restart;
 // pub mod blend;
 // pub mod lode;

@@ -1,13 +1,17 @@
 use futures::{
-    Sink,
     Future,
-    Stream,
-    sync::{
+    SinkExt,
+    StreamExt,
+    FutureExt,
+    channel::{
         mpsc,
         oneshot,
     },
-    future::Either,
+    select,
+    pin_mut,
 };
+
+use tokio::runtime::Handle;
 
 use log::{
     warn,
@@ -15,147 +19,103 @@ use log::{
     error,
 };
 
-struct Shutdown;
+use super::Terminate;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct SupervisorLoopGone;
 
 pub struct Supervisor {
-    executor: tokio::runtime::TaskExecutor,
+    runtime_handle: Handle,
     notify_tx: mpsc::Sender<SupervisorNotify>,
-    shutdown_rx: oneshot::Receiver<Shutdown>,
-}
-
-enum SupervisorNotify {
-    Spawned(oneshot::Sender<Shutdown>),
-    Exited,
+    shutdown_rx: oneshot::Receiver<Terminate<()>>,
 }
 
 impl Supervisor {
-    pub fn new(executor: &tokio::runtime::TaskExecutor) -> Supervisor {
+    pub fn new() -> Supervisor {
+        Supervisor::with_runtime_handle(Handle::current())
+    }
+
+    pub fn with_runtime_handle(runtime_handle: Handle) -> Supervisor {
         let (notify_tx, notify_rx) = mpsc::channel(0);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        executor.spawn(supervisor_loop(notify_rx, shutdown_tx));
+        runtime_handle.spawn(supervisor_loop(notify_rx, shutdown_tx));
 
-        Supervisor {
-            executor: executor.clone(),
-            notify_tx,
-            shutdown_rx,
-        }
+        Supervisor { runtime_handle, notify_tx, shutdown_rx, }
     }
 
-    pub fn executor(&self) -> &tokio::runtime::TaskExecutor {
-        &self.executor
-    }
-
-    pub fn spawn_link<F>(&self, restartable_future: F) where F: Future<Item = (), Error = ()> + Send + 'static {
+    pub fn spawn_link<F>(&self, future: F) where F: Future<Output = ()> + Send + 'static {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let future = self.notify_tx
-            .clone()
-            .send(SupervisorNotify::Spawned(shutdown_tx))
-            .map_err(|_send_error| {
-                warn!("supervisor is gone before task is actually spawned");
-            })
-            .and_then(move |notify_tx| {
-                restartable_future
-                    .select2(shutdown_rx)
-                    .then(|result| {
-                        match result {
-                            Ok(Either::A(((), _shutdown_rx))) => {
-                                debug!("a process was terminated (normally)");
-                                Ok(())
+
+        let mut child_notify_tx = self.notify_tx.clone();
+        let future = async move {
+            let fused_future = future.fuse();
+            let mut fused_shutdown_rx = shutdown_rx.fuse();
+            pin_mut!(fused_future);
+
+            match child_notify_tx.send(SupervisorNotify::Spawned(shutdown_tx)).await {
+                Ok(()) =>
+                    select! {
+                        () = fused_future => {
+                            debug!("a process was terminated");
+                            child_notify_tx.send(SupervisorNotify::Exited).await.ok();
+                        },
+                        result = fused_shutdown_rx =>
+                            match result {
+                                Ok(Terminate(())) =>
+                                    debug!("a process was terminated (shutted down)"),
+                                Err(oneshot::Canceled) =>
+                                    debug!("a process was terminated (shutdown channel supervisor endpoint dropped)"),
                             },
-                            Ok(Either::B((Shutdown, _task_future))) => {
-                                debug!("a process was terminated (shutted down)");
-                                Ok(())
-                            },
-                            Err(Either::A(((), _shutdown_rx))) => {
-                                error!("a process was terminated (task error)");
-                                Err(())
-                            },
-                            Err(Either::B((oneshot::Canceled, _task_future))) => {
-                                debug!("a process was terminated (shutdown channel supervisor endpoint dropped)");
-                                Err(())
-                            },
-                        }
-                    })
-                    .then(move |upper_result| {
-                        notify_tx.send(SupervisorNotify::Exited)
-                            .then(move |_send_result| upper_result)
-                    })
-            });
-        self.executor.spawn(future);
+                    },
+                Err(_send_error) =>
+                    warn!("supervisor is gone before child is actually spawned"),
+            }
+        };
+        self.runtime_handle.spawn(future);
     }
 
-    pub fn shutdown_on_idle(self, runtime: &mut tokio::runtime::Runtime) -> Result<(), SupervisorLoopGone> {
-        let shutdown_future = self.shutdown_rx
-            .then(|shutdown_result| {
-                match shutdown_result {
-                    Ok(Shutdown) =>
-                        Ok(()),
-                    Err(oneshot::Canceled) => {
-                        error!("supervisor loop dropped its shutdown channel endpoint unexpectedly");
-                        Err(SupervisorLoopGone)
-                    }
-                }
-            });
-        runtime.block_on(shutdown_future)
+    pub async fn shutdown_on_idle(self) -> Result<(), SupervisorLoopGone> {
+        match self.shutdown_rx.await {
+            Ok(Terminate(())) =>
+                Ok(()),
+            Err(oneshot::Canceled) => {
+                error!("supervisor loop dropped unexpectedly its shutdown channel endpoint");
+                Err(SupervisorLoopGone)
+            }
+        }
     }
 }
 
-fn supervisor_loop(
-    notify_rx: mpsc::Receiver<SupervisorNotify>,
-    shutdown_tx: oneshot::Sender<Shutdown>,
-)
-    -> impl Future<Item = (), Error = ()>
-{
+enum SupervisorNotify {
+    Spawned(oneshot::Sender<Terminate<()>>),
+    Exited,
+
+}
+
+async fn supervisor_loop(mut notify_rx: mpsc::Receiver<SupervisorNotify>, shutdown_tx: oneshot::Sender<Terminate<()>>) {
     debug!("supervisor loop started");
 
-    enum Event {
-        SpawnNotify(oneshot::Sender<Shutdown>),
-        ExitNotify,
-        Disconnected,
+    let mut children_txs = Vec::new();
+    while let Some(event) = notify_rx.next().await {
+        match event {
+            SupervisorNotify::Spawned(notify_tx) => {
+                debug!("a process was spawned");
+                children_txs.push(notify_tx);
+            },
+            SupervisorNotify::Exited => {
+                debug!("a supervised process was terminated");
+                break;
+            },
+        }
     }
 
-    notify_rx
-        .then(|event| {
-            match event {
-                Ok(SupervisorNotify::Spawned(notify)) =>
-                    Ok(Event::SpawnNotify(notify)),
-                Ok(SupervisorNotify::Exited) =>
-                    Ok(Event::ExitNotify),
-                Err(()) =>
-                    Ok(Event::Disconnected)
-            }
-        })
-        .fold(Vec::new(), |mut linked, event| {
-            match event {
-                Event::SpawnNotify(notify) => {
-                    debug!("a process was spawned");
-                    linked.push(notify);
-                    Ok(linked)
-                },
-                Event::ExitNotify | Event::Disconnected =>
-                    Err(linked),
-            }
-        })
-        .then(|result| {
-            let linked = match result {
-                Ok(linked) => linked,
-                Err(linked) => linked,
-            };
-            debug!("supervisor spawn notify endpoint disconnected: terminating {} linked processes", linked.len());
-
-            for linked_tx in linked {
-                if let Err(..) = linked_tx.send(Shutdown) {
-                    debug!("supervised task is gone while performing shutdown");
-                }
-            }
-
-            if let Err(..) = shutdown_tx.send(Shutdown) {
-                debug!("supervisor shutdown channel endpoint dropped");
-            }
-
-            Ok(())
-        })
+    debug!("supervisor spawn notify endpoint disconnected: terminating {} linked processes", children_txs.len());
+    for child_tx in children_txs {
+        if let Err(..) = child_tx.send(Terminate(())) {
+            debug!("supervised child is gone while performing shutdown");
+        }
+    }
+    if let Err(..) = shutdown_tx.send(Terminate(())) {
+        debug!("supervisor shutdown channel endpoint dropped");
+    }
 }
