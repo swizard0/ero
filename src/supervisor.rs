@@ -104,7 +104,6 @@ impl Supervisor {
         };
         self.runtime_handle.spawn(future);
     }
-
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash, Debug)]
