@@ -1,27 +1,23 @@
 use std::{
-//     mem,
-//     sync::Arc,
+    sync::Arc,
     fmt::Debug,
 };
 
 use futures::{
+    select,
     Future,
     stream::{
         self,
         StreamExt,
     },
+    sink::SinkExt,
     channel::{
         mpsc,
         oneshot,
     },
-//     Sink,
-//     Poll,
-//     Async,
-//     AsyncSink,
 };
 
 use log::{
-    debug,
     info,
     error,
 };
@@ -52,6 +48,11 @@ pub struct State<MT, MN, BMS, MB, C, SB, H, I> {
     slaves_bootstrap: SB,
     slaves_handler: H,
     slaves_iter: I,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum PushTaskError {
+    BackgroundTaskGone,
 }
 
 impl<MT> Pool<MT> {
@@ -91,25 +92,34 @@ impl<MT> Pool<MT> {
             },
         )
     }
+
+    pub async fn push_task(&mut self, task: MT) -> Result<(), PushTaskError> {
+        self.tasks_tx.send(task).await
+            .map_err(|_send_error| PushTaskError::BackgroundTaskGone)
+    }
 }
 
 pub async fn run<MN, SN, MB, FMB, EMB, BMS, MS, C, FC, EC, SB, FSB, ESB, BSS, SS, H, FH, EH, MT, ST, I>(
     init: Init<MT, MN, BMS, MB, C, SB, H, I>,
 )
 where MN: AsRef<str> + Send + 'static,
-      SN: AsRef<str>,
-      MB: Fn(BMS) -> FMB + Send + 'static,
-      FMB: Future<Output = Result<MS, ErrorSeverity<BMS, EMB>>>,
+      SN: AsRef<str> + Send + 'static,
+      MB: Fn(BMS) -> FMB + Send + Sync + 'static,
+      FMB: Future<Output = Result<MS, ErrorSeverity<BMS, EMB>>> + Send,
       BMS: Send + 'static,
-      EMB: Debug,
-      C: Fn(MT, MS) -> FC + Send + 'static,
-      FC: Future<Output = Result<(ST, MS), ErrorSeverity<BMS, EC>>>,
-      EC: Debug,
-      SB: Fn(BSS) -> FSB,
-      FSB: Future<Output = Result<SS, ErrorSeverity<BSS, ESB>>>,
-      H: Fn(ST, SS) -> FH,
-      FH: Future<Output = Result<SS, ErrorSeverity<BSS, EH>>>,
-      EH: Debug,
+      EMB: Debug + Send,
+      C: Fn(MT, MS) -> FC + Send + Sync + 'static,
+      FC: Future<Output = Result<(ST, MS), ErrorSeverity<BMS, EC>>> + Send,
+      MS: Send,
+      EC: Debug + Send,
+      SB: Fn(BSS) -> FSB + Send + Sync + 'static,
+      BSS: Send + 'static,
+      FSB: Future<Output = Result<SS, ErrorSeverity<BSS, ESB>>> + Send,
+      ESB: Debug + Send,
+      H: Fn(ST, SS) -> FH + Send + Sync + 'static,
+      SS: Send,
+      FH: Future<Output = Result<SS, ErrorSeverity<BSS, EH>>> + Send,
+      EH: Debug + Send,
       MT: Send + 'static,
       ST: Send + 'static,
       I: IntoIterator<Item = (Params<SN>, BSS)>,
@@ -158,107 +168,40 @@ where MN: AsRef<str> + Send + 'static,
         }
     });
 
+    let shared_bootstrap = Arc::new(slaves_bootstrap);
+    let shared_handler = Arc::new(slaves_handler);
+
+    for (params, init_state) in slaves_iter {
+        let bootstrap = shared_bootstrap.clone();
+        let handler = shared_handler.clone();
+        let slaves_tx = slaves_tx.clone();
+        supervisor.spawn_link_permanent(async move {
+            let slave_result = run_slave(
+                params,
+                init_state,
+                move |state| bootstrap(state),
+                slaves_tx,
+                move |task, state| handler(task, state),
+            ).await;
+            match slave_result {
+                Ok(()) =>
+                    (),
+                Err(SlaveError::Bootstrap(error)) =>
+                    error!("state bootstrap error in slave: {:?}", error),
+                Err(SlaveError::Handler(error)) =>
+                    error!("task handler error in slave: {:?}", error),
+                Err(SlaveError::MasterChannelDropped) =>
+                    error!("master channel dropped in slave"),
+                Err(SlaveError::TasksChannelDropped) =>
+                    error!("tasks channel dropped in slave"),
+                Err(SlaveError::CrashForced) =>
+                    info!("crash forced after error in slave"),
+            }
+        });
+    }
+
     supervisor::run(supervisor_init).await
 }
-
-// pub fn spawn_pool<MN, SN, MB, FMB, EMB, BMS, MS, C, FC, EC, SB, FSB, ESB, BSS, SS, H, FH, EH, MT, ST, I>(
-//     supervisor: &supervisor::Supervisor,
-//     master_params: Params<MN>,
-//     master_init_state: BMS,
-//     master_bootstrap: MB,
-//     master_converter: C,
-//     slaves_bootstrap: SB,
-//     slaves_handler: H,
-//     slaves_iter: I,
-// )
-//     -> mpsc::Sender<MT>
-// where MN: AsRef<str> + Send + 'static,
-//       SN: AsRef<str> + Send + 'static,
-//       MB: Fn(BMS) -> FMB + Send + 'static,
-//       FMB: IntoFuture<Item = MS, Error = ErrorSeverity<BMS, EMB>> + 'static,
-//       FMB::Future: Send,
-//       EMB: Debug + Send + 'static,
-//       BMS: Send + 'static,
-//       MS: Send + 'static,
-//       C: Fn(MT, MS) -> FC + Send + 'static,
-//       FC: IntoFuture<Item = (ST, MS), Error = ErrorSeverity<BMS, EC>> + 'static,
-//       FC::Future: Send,
-//       EC: Debug + Send + 'static,
-//       MT: Send + 'static,
-//       ST: Send + 'static,
-//       SB: Fn(BSS) -> FSB + Sync + Send + 'static,
-//       FSB: IntoFuture<Item = SS, Error = ErrorSeverity<BSS, ESB>> + 'static,
-//       FSB::Future: Send,
-//       ESB: Debug + Send + 'static,
-//       SS: Send + 'static,
-//       BSS: Send + 'static,
-//       H: Fn(ST, SS) -> FH + Sync + Send + 'static,
-//       FH: IntoFuture<Item = SS, Error = ErrorSeverity<BSS, EH>> + 'static,
-//       FH::Future: Send,
-//       EH: Debug + Send + 'static,
-//       I: IntoIterator<Item = (Params<SN>, BSS)>,
-// {
-//     let (tasks_tx, tasks_rx) = mpsc::channel(1);
-//     let (slaves_tx, slaves_rx) = mpsc::channel(1);
-
-//     supervisor.spawn_link(
-//         run_master(
-//             master_params,
-//             master_init_state,
-//             master_bootstrap,
-//             tasks_rx,
-//             slaves_rx,
-//             master_converter,
-//         ).map_err(|error| match error {
-//             MasterError::Bootstrap(error) =>
-//                 error!("state bootstrap error in master: {:?}", error),
-//             MasterError::Converter(error) =>
-//                 error!("tasks converter error in master: {:?}", error),
-//             MasterError::TasksChannelDropped =>
-//                 error!("tasks channel dropped in master"),
-//             MasterError::TasksChannelDepleted =>
-//                 info!("tasks channel depleted in master"),
-//             MasterError::SlavesChannelDropped =>
-//                 error!("slaves channel dropped in master"),
-//             MasterError::SlavesChannelDepleted =>
-//                 info!("slaves channel depleted in master"),
-//             MasterError::SlaveTaskChannelDropped =>
-//                 error!("slave task channel dropped in master"),
-//             MasterError::CrashForced =>
-//                 info!("crash forced after error in master"),
-//         })
-//     );
-
-//     let shared_bootstrap = Arc::new(slaves_bootstrap);
-//     let shared_handler = Arc::new(slaves_handler);
-
-//     for (params, init_state) in slaves_iter {
-//         let bootstrap = shared_bootstrap.clone();
-//         let handler = shared_handler.clone();
-//         supervisor.spawn_link(
-//             run_slave(
-//                 params,
-//                 init_state,
-//                 move |state| bootstrap(state),
-//                 slaves_tx.clone(),
-//                 move |task, state| handler(task, state),
-//             ).map_err(|error| match error {
-//                 SlaveError::Bootstrap(error) =>
-//                     error!("state bootstrap error in slave: {:?}", error),
-//                 SlaveError::Handler(error) =>
-//                     error!("task handler error in slave: {:?}", error),
-//                 SlaveError::MasterChannelDropped =>
-//                     error!("master channel dropped in slave"),
-//                 SlaveError::TasksChannelDropped =>
-//                     error!("tasks channel dropped in slave"),
-//                 SlaveError::CrashForced =>
-//                     info!("crash forced after error in slave"),
-//             }),
-//         );
-//     }
-
-//     tasks_tx
-// }
 
 #[derive(Debug)]
 pub enum MasterError<EB, EC> {
@@ -272,7 +215,7 @@ pub enum MasterError<EB, EC> {
     CrashForced,
 }
 
-pub async fn run_master<N, B, FB, EB, BS, C, FC, EC, S, MT, ST>(
+async fn run_master<N, B, FB, EB, BS, C, FC, EC, S, MT, ST>(
     params: Params<N>,
     init_state: BS,
     bootstrap: B,
@@ -287,351 +230,176 @@ where N: AsRef<str>,
       C: Fn(MT, S) -> FC,
       FC: Future<Output = Result<(ST, S), ErrorSeverity<BS, EC>>>,
 {
+    struct RestartableState<BS, B, MT, ST, C> {
+        state: BS,
+        bootstrap: B,
+        fused_tasks_rx: stream::Fuse<mpsc::Receiver<MT>>,
+        fused_slaves_rx: stream::Fuse<mpsc::Receiver<oneshot::Sender<ST>>>,
+        converter: C,
+    }
 
-    Ok(())
-//     struct RestartableState<BS, B, MT, ST, C> {
-//         state: BS,
-//         bootstrap: B,
-//         tasks_rx: mpsc::Receiver<MT>,
-//         slaves_rx: mpsc::Receiver<oneshot::Sender<ST>>,
-//         converter: C,
-//     }
+    restart::restartable(
+        params,
+        RestartableState {
+            state: init_state,
+            bootstrap,
+            fused_tasks_rx,
+            fused_slaves_rx,
+            converter,
+        },
+        |RestartableState { state: init_state, bootstrap, mut fused_tasks_rx, mut fused_slaves_rx, converter, }| {
+            async move {
+                let bootstrap_result = bootstrap(init_state).await;
+                let mut state = match bootstrap_result {
+                    Ok(state) =>
+                        state,
+                    Err(ErrorSeverity::Fatal(error)) =>
+                        return Err(ErrorSeverity::Fatal(MasterError::Bootstrap(error))),
+                    Err(ErrorSeverity::Recoverable { state, }) =>
+                        return Err(ErrorSeverity::Recoverable {
+                            state: RestartableState { state, bootstrap, fused_tasks_rx, fused_slaves_rx, converter, },
+                        }),
+                };
 
-//     restart::restartable(
-//         params,
-//         RestartableState {
-//             state: init_state,
-//             bootstrap,
-//             tasks_rx,
-//             slaves_rx,
-//             converter,
-//         },
-//         |RestartableState { state: init_state, bootstrap, tasks_rx, slaves_rx, converter, }| {
-//             bootstrap(init_state)
-//                 .into_future()
-//                 .then(move |bootstrap_result| match bootstrap_result {
-//                     Ok(state) => {
-//                         enum Source<A, B> {
-//                             Task(A),
-//                             Slave(B),
-//                         }
+                let mut pending = Vec::new();
+                let mut slaves: Vec<oneshot::Sender<_>> = Vec::new();
 
-//                         struct State<S, B, ST, C> {
-//                             state: S,
-//                             bootstrap: B,
-//                             pending: Vec<ST>,
-//                             slaves: Vec<oneshot::Sender<ST>>,
-//                             converter: C,
-//                         }
+                enum Source<A, B> {
+                    Task(A),
+                    Slave(B),
+                }
 
-//                         let blender = Blender::new()
-//                             .add(tasks_rx)
-//                             .add(slaves_rx)
-//                             .finish_sources()
-//                             .fold(Source::Slave, Source::Slave)
-//                             .fold(Source::Task, Source::Task)
-//                             .finish();
+                loop {
+                    let req = select! {
+                        result = fused_tasks_rx.next() =>
+                            Source::Task(result),
+                        result = fused_slaves_rx.next() =>
+                            Source::Slave(result),
+                    };
 
-//                         let state = State {
-//                             state,
-//                             bootstrap,
-//                             pending: Vec::new(),
-//                             slaves: Vec::new(),
-//                             converter,
-//                         };
-
-//                         let future = loop_fn((blender, state), |(blender, mut state)| {
-//                             blender
-//                                 .then(move |blend_result| match blend_result {
-//                                     Ok((Source::Task(master_task), blender)) => {
-//                                         let State { state, bootstrap, mut pending, mut slaves, converter, } = state;
-//                                         let future = converter(master_task, state)
-//                                             .into_future()
-//                                             .then(move |converter_result| match converter_result {
-//                                                 Ok((task, state)) => match slaves.pop() {
-//                                                     Some(slave_tx) =>
-//                                                         match slave_tx.send(task) {
-//                                                             Ok(()) => {
-//                                                                 let state = State { state, bootstrap, pending, slaves, converter, };
-//                                                                 Ok(Loop::Continue((blender, state)))
-//                                                             },
-//                                                             Err(_task) =>
-//                                                                 Err(ErrorSeverity::Fatal(MasterError::SlaveTaskChannelDropped)),
-//                                                         },
-//                                                     None => {
-//                                                         pending.push(task);
-//                                                         let state = State { state, bootstrap, pending, slaves, converter, };
-//                                                         Ok(Loop::Continue((blender, state)))
-//                                                     },
-//                                                 },
-//                                                 Err(ErrorSeverity::Fatal(error)) =>
-//                                                     Err(ErrorSeverity::Fatal(MasterError::Converter(error))),
-//                                                 Err(ErrorSeverity::Recoverable { state, }) => {
-//                                                     let (tasks_rx, (slaves_rx, ())) = blender.decompose();
-//                                                     Err(ErrorSeverity::Recoverable {
-//                                                         state: RestartableState {
-//                                                             state, bootstrap, tasks_rx, slaves_rx, converter,
-//                                                         },
-//                                                     })
-//                                                 },
-//                                             });
-//                                         Either::A(future)
-//                                     },
-//                                     Ok((Source::Slave(slave_online_tx), blender)) => {
-//                                         let future_result = match state.pending.pop() {
-//                                             Some(task) =>
-//                                                 match slave_online_tx.send(task) {
-//                                                     Ok(()) =>
-//                                                         Ok(Loop::Continue((blender, state))),
-//                                                     Err(_task) =>
-//                                                         Err(ErrorSeverity::Fatal(MasterError::SlaveTaskChannelDropped)),
-//                                                 },
-//                                             None => {
-//                                                 state.slaves.push(slave_online_tx);
-//                                                 Ok(Loop::Continue((blender, state)))
-//                                             },
-//                                         };
-//                                         Either::B(result(future_result))
-//                                     },
-//                                     Err(Source::Task(ErrorEvent::Depleted {
-//                                         decomposed: DecomposeZip { left_dir: (_slaves_rx, ()), myself: Gone, right_rev: (), },
-//                                     })) =>
-//                                         Either::B(result(Err(ErrorSeverity::Fatal(MasterError::TasksChannelDepleted)))),
-//                                     Err(Source::Slave(ErrorEvent::Depleted {
-//                                         decomposed: DecomposeZip { left_dir: (), myself: Gone, right_rev: (_tasks_rx, ()), },
-//                                     })) =>
-//                                         Either::B(result(Err(ErrorSeverity::Fatal(MasterError::SlavesChannelDepleted)))),
-//                                     Err(Source::Task(ErrorEvent::Error {
-//                                         error: (),
-//                                         decomposed: DecomposeZip { left_dir: (_slaves_rx, ()), myself: Gone, right_rev: (), },
-//                                     })) =>
-//                                         Either::B(result(Err(ErrorSeverity::Fatal(MasterError::TasksChannelDropped)))),
-//                                     Err(Source::Slave(ErrorEvent::Error {
-//                                         error: (),
-//                                         decomposed: DecomposeZip { left_dir: (), myself: Gone, right_rev: (_tasks_rx, ()), },
-//                                     })) =>
-//                                         Either::B(result(Err(ErrorSeverity::Fatal(MasterError::SlavesChannelDropped)))),
-//                                 })
-//                         });
-//                         Either::A(future)
-//                     },
-//                     Err(ErrorSeverity::Fatal(error)) =>
-//                         Either::B(result(Err(ErrorSeverity::Fatal(MasterError::Bootstrap(error))))),
-//                     Err(ErrorSeverity::Recoverable { state, }) =>
-//                         Either::B(result(Err(ErrorSeverity::Recoverable {
-//                             state: RestartableState { state, bootstrap, tasks_rx, slaves_rx, converter, },
-//                         }))),
-//                 })
-//         })
-//         .map_err(|restartable_error| match restartable_error {
-//             restart::RestartableError::Fatal(error) =>
-//                 error,
-//             restart::RestartableError::RestartCrashForced =>
-//                 MasterError::CrashForced,
-//         })
+                    match req {
+                        Source::Task(Some(master_task)) =>
+                            match converter(master_task, state).await {
+                                Ok((task, next_state)) => {
+                                    state = next_state;
+                                    match slaves.pop() {
+                                        Some(slave_tx) => {
+                                            slave_tx.send(task)
+                                                .map_err(|_send_error| ErrorSeverity::Fatal(MasterError::SlaveTaskChannelDropped))?;
+                                        },
+                                        None =>
+                                            pending.push(task),
+                                    }
+                                },
+                                Err(ErrorSeverity::Fatal(error)) =>
+                                    return Err(ErrorSeverity::Fatal(MasterError::Converter(error))),
+                                Err(ErrorSeverity::Recoverable { state: next_state, }) =>
+                                    return Err(ErrorSeverity::Recoverable {
+                                        state: RestartableState { state: next_state, bootstrap, fused_tasks_rx, fused_slaves_rx, converter, },
+                                    }),
+                            },
+                        Source::Task(None) =>
+                            return Err(ErrorSeverity::Fatal(MasterError::TasksChannelDepleted)),
+                        Source::Slave(Some(slave_online_tx)) => {
+                            match pending.pop() {
+                                Some(task) => {
+                                    slave_online_tx.send(task)
+                                        .map_err(|_send_error| ErrorSeverity::Fatal(MasterError::SlaveTaskChannelDropped))?;
+                                    },
+                                None =>
+                                    slaves.push(slave_online_tx),
+                            }
+                        },
+                        Source::Slave(None) =>
+                            return Err(ErrorSeverity::Fatal(MasterError::SlavesChannelDepleted)),
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|restartable_error| match restartable_error {
+            restart::RestartableError::Fatal(error) =>
+                error,
+            restart::RestartableError::RestartCrashForced =>
+                MasterError::CrashForced,
+        })
 }
 
-// #[derive(Debug)]
-// pub enum SlaveError<EB, EH> {
-//     Bootstrap(EB),
-//     Handler(EH),
-//     MasterChannelDropped,
-//     TasksChannelDropped,
-//     CrashForced,
-// }
+#[derive(Debug)]
+pub enum SlaveError<EB, EH> {
+    Bootstrap(EB),
+    Handler(EH),
+    MasterChannelDropped,
+    TasksChannelDropped,
+    CrashForced,
+}
 
-// pub fn run_slave<N, B, EB, FB, BS, S, T, H, EH, FH>(
-//     params: Params<N>,
-//     init_state: BS,
-//     bootstrap: B,
-//     slaves_tx: mpsc::Sender<oneshot::Sender<T>>,
-//     handler: H,
-// )
-//     -> impl Future<Item = (), Error = SlaveError<EB, EH>>
-// where N: AsRef<str>,
-//       B: Fn(BS) -> FB,
-//       FB: IntoFuture<Item = S, Error = ErrorSeverity<BS, EB>>,
-//       H: Fn(T, S) -> FH,
-//       FH: IntoFuture<Item = S, Error = ErrorSeverity<BS, EH>>,
-// {
-//     restart::restartable(
-//         params,
-//         SlaveState { init_state, bootstrap, slaves_tx, handler, },
-//         |state| SlaveFuture {
-//             mode: SlaveMode::Bootstrap {
-//                 ctx: SlaveContext {
-//                     bootstrap: state.bootstrap,
-//                     handler: state.handler,
-//                     slaves_tx: state.slaves_tx,
-//                 },
-//                 init_state: state.init_state,
-//             },
-//         })
-//         .map_err(|restartable_error| match restartable_error {
-//             restart::RestartableError::Fatal(error) =>
-//                 error,
-//             restart::RestartableError::RestartCrashForced =>
-//                 SlaveError::CrashForced,
-//         })
-// }
+async fn run_slave<N, B, EB, FB, BS, S, T, H, EH, FH>(
+    params: Params<N>,
+    init_state: BS,
+    bootstrap: B,
+    slaves_tx: mpsc::Sender<oneshot::Sender<T>>,
+    handler: H,
+)
+    -> Result<(), SlaveError<EB, EH>>
+where N: AsRef<str>,
+      B: Fn(BS) -> FB,
+      FB: Future<Output = Result<S, ErrorSeverity<BS, EB>>>,
+      H: Fn(T, S) -> FH,
+      FH: Future<Output = Result<S, ErrorSeverity<BS, EH>>>,
+{
+    struct RestartableState<S, B, T, H> {
+        state: S,
+        bootstrap: B,
+        slaves_tx: mpsc::Sender<oneshot::Sender<T>>,
+        handler: H,
+    }
 
-// struct SlaveState<S, B, T, H> {
-//     init_state: S,
-//     bootstrap: B,
-//     slaves_tx: mpsc::Sender<oneshot::Sender<T>>,
-//     handler: H,
-// }
+    restart::restartable(
+        params,
+        RestartableState { state: init_state, bootstrap, slaves_tx, handler, },
+        |RestartableState { state: init_state, bootstrap, mut slaves_tx, handler, }| {
+            async move {
+                let bootstrap_result = bootstrap(init_state).await;
+                let mut state = match bootstrap_result {
+                    Ok(state) =>
+                        state,
+                    Err(ErrorSeverity::Fatal(error)) =>
+                        return Err(ErrorSeverity::Fatal(SlaveError::Bootstrap(error))),
+                    Err(ErrorSeverity::Recoverable { state, }) =>
+                        return Err(ErrorSeverity::Recoverable {
+                            state: RestartableState { state, bootstrap, slaves_tx, handler, },
+                        }),
+                };
 
-// struct SlaveFuture<BS, S, B, FFB, T, H, FFH> {
-//     mode: SlaveMode<BS, S, B, FFB, T, H, FFH>,
-// }
+                loop {
+                    let (task_tx, task_rx) = oneshot::channel();
+                    slaves_tx.send(task_tx).await
+                        .map_err(|_send_error| ErrorSeverity::Fatal(SlaveError::MasterChannelDropped))?;
 
-// struct SlaveContext<B, H, T> {
-//     bootstrap: B,
-//     handler: H,
-//     slaves_tx: mpsc::Sender<oneshot::Sender<T>>,
-// }
+                    let task = task_rx.await
+                        .map_err(|oneshot::Canceled| ErrorSeverity::Fatal(SlaveError::TasksChannelDropped))?;
 
-// enum SlaveMode<BS, S, B, FFB, T, H, FFH> {
-//     Invalid,
-//     Bootstrap { ctx: SlaveContext<B, H, T>, init_state: BS, },
-//     BootstrapWait { ctx: SlaveContext<B, H, T>, future: FFB, },
-//     SlaveStartSend {
-//         ctx: SlaveContext<B, H, T>,
-//         state: S,
-//         task_tx: oneshot::Sender<T>,
-//         task_rx: oneshot::Receiver<T>,
-//     },
-//     SlavePollSend {
-//         ctx: SlaveContext<B, H, T>,
-//         state: S,
-//         task_rx: oneshot::Receiver<T>,
-//     },
-//     TaskRecv {
-//         ctx: SlaveContext<B, H, T>,
-//         state: S,
-//         task_rx: oneshot::Receiver<T>,
-//     },
-//     HandlerWait { ctx: SlaveContext<B, H, T>, future: FFH, },
-// }
-
-// impl<BS, S, B, FB, EB, T, H, FH, EH> Future for SlaveFuture<BS, S, B, FB::Future, T, H, FH::Future>
-// where B: Fn(BS) -> FB,
-//       FB: IntoFuture<Item = S, Error = ErrorSeverity<BS, EB>>,
-//       H: Fn(T, S) -> FH,
-//       FH: IntoFuture<Item = S, Error = ErrorSeverity<BS, EH>>,
-// {
-//     type Item = ();
-//     type Error = ErrorSeverity<SlaveState<BS, B, T, H>, SlaveError<EB, EH>>;
-
-//     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-//         loop {
-//             match mem::replace(&mut self.mode, SlaveMode::Invalid) {
-//                 SlaveMode::Invalid =>
-//                     panic!("cannot poll SlaveFuture twice"),
-
-//                 SlaveMode::Bootstrap { ctx, init_state, } => {
-//                     debug!("SlaveMode::Bootstrap");
-//                     let future = (ctx.bootstrap)(init_state)
-//                         .into_future();
-//                     self.mode = SlaveMode::BootstrapWait { ctx, future, };
-//                 },
-
-//                 SlaveMode::BootstrapWait { ctx, mut future, } => {
-//                     debug!("SlaveMode::BootstrapWait");
-//                     match future.poll() {
-//                         Ok(Async::NotReady) => {
-//                             self.mode = SlaveMode::BootstrapWait { ctx, future, };
-//                             return Ok(Async::NotReady);
-//                         },
-//                         Ok(Async::Ready(state)) => {
-//                             let (task_tx, task_rx) = oneshot::channel();
-//                             self.mode = SlaveMode::SlaveStartSend { ctx, state, task_tx, task_rx, };
-//                         },
-//                         Err(ErrorSeverity::Recoverable { state, }) =>
-//                             return Err(ErrorSeverity::Recoverable {
-//                                 state: SlaveState {
-//                                     init_state: state,
-//                                     bootstrap: ctx.bootstrap,
-//                                     slaves_tx: ctx.slaves_tx,
-//                                     handler: ctx.handler,
-//                                 },
-//                             }),
-//                         Err(ErrorSeverity::Fatal(error)) =>
-//                             return Err(ErrorSeverity::Fatal(SlaveError::Bootstrap(error))),
-//                     }
-//                 },
-
-//                 SlaveMode::SlaveStartSend { mut ctx, state, task_tx, task_rx, } => {
-//                     debug!("SlaveMode::SlaveStartSend");
-//                     match ctx.slaves_tx.start_send(task_tx) {
-//                         Ok(AsyncSink::NotReady(task_tx)) => {
-//                             self.mode = SlaveMode::SlaveStartSend { ctx, state, task_tx, task_rx, };
-//                             return Ok(Async::NotReady);
-//                         },
-//                         Ok(AsyncSink::Ready) =>
-//                             self.mode = SlaveMode::SlavePollSend { ctx, state, task_rx, },
-//                         Err(_send_error) =>
-//                             return Err(ErrorSeverity::Fatal(SlaveError::MasterChannelDropped)),
-//                     }
-//                 },
-
-//                 SlaveMode::SlavePollSend { mut ctx, state, task_rx, } => {
-//                     debug!("SlaveMode::SlavePollSend");
-//                     match ctx.slaves_tx.poll_complete() {
-//                         Ok(Async::NotReady) => {
-//                             self.mode = SlaveMode::SlavePollSend { ctx, state, task_rx, };
-//                             return Ok(Async::NotReady);
-//                         },
-//                         Ok(Async::Ready(())) =>
-//                             self.mode = SlaveMode::TaskRecv { ctx, state, task_rx, },
-//                         Err(_poll_error) =>
-//                             return Err(ErrorSeverity::Fatal(SlaveError::MasterChannelDropped)),
-//                     }
-//                 },
-
-//                 SlaveMode::TaskRecv { ctx, state, mut task_rx, } => {
-//                     debug!("SlaveMode::TaskRecv");
-//                     match task_rx.poll() {
-//                         Ok(Async::NotReady) => {
-//                             self.mode = SlaveMode::TaskRecv { ctx, state, task_rx, };
-//                             return Ok(Async::NotReady);
-//                         },
-//                         Ok(Async::Ready(task)) => {
-//                             let future = (ctx.handler)(task, state)
-//                                 .into_future();
-//                             self.mode = SlaveMode::HandlerWait { ctx, future, };
-//                         },
-//                         Err(oneshot::Canceled) =>
-//                             return Err(ErrorSeverity::Fatal(SlaveError::TasksChannelDropped)),
-//                     }
-//                 },
-
-//                 SlaveMode::HandlerWait { ctx, mut future, } => {
-//                     debug!("SlaveMode::HandlerWait");
-//                     match future.poll() {
-//                         Ok(Async::NotReady) => {
-//                             self.mode = SlaveMode::HandlerWait { ctx, future, };
-//                             return Ok(Async::NotReady);
-//                         },
-//                         Ok(Async::Ready(state)) => {
-//                             let (task_tx, task_rx) = oneshot::channel();
-//                             self.mode = SlaveMode::SlaveStartSend { ctx, state, task_tx, task_rx, };
-//                         },
-//                         Err(ErrorSeverity::Recoverable { state, }) =>
-//                             return Err(ErrorSeverity::Recoverable {
-//                                 state: SlaveState {
-//                                     init_state: state,
-//                                     bootstrap: ctx.bootstrap,
-//                                     slaves_tx: ctx.slaves_tx,
-//                                     handler: ctx.handler,
-//                                 },
-//                             }),
-//                         Err(ErrorSeverity::Fatal(error)) =>
-//                             return Err(ErrorSeverity::Fatal(SlaveError::Handler(error))),
-//                     }
-//                 },
-//             }
-//         }
-//     }
-// }
+                    match handler(task, state).await {
+                        Ok(next_state) =>
+                            state = next_state,
+                        Err(ErrorSeverity::Recoverable { state: next_state, }) =>
+                            return Err(ErrorSeverity::Recoverable {
+                                state: RestartableState {
+                                    state: next_state, bootstrap, slaves_tx, handler,
+                                },
+                            }),
+                        Err(ErrorSeverity::Fatal(error)) =>
+                            return Err(ErrorSeverity::Fatal(SlaveError::Handler(error))),
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|restartable_error| match restartable_error {
+            restart::RestartableError::Fatal(error) =>
+                error,
+            restart::RestartableError::RestartCrashForced =>
+                SlaveError::CrashForced,
+        })
+}
