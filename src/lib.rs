@@ -2,9 +2,7 @@ use std::time::Duration;
 
 pub mod supervisor;
 pub mod restart;
-// pub mod blend;
-// pub mod lode;
-// pub mod pool;
+pub mod pool;
 // pub mod net;
 mod macros;
 
