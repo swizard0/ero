@@ -29,6 +29,7 @@ use super::{
     ErrorSeverity,
 };
 
+#[derive(Clone)]
 pub struct Pool<MT> {
     tasks_tx: mpsc::Sender<MT>,
 }
