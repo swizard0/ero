@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use futures::{
     Future,
     SinkExt,
@@ -22,47 +20,50 @@ use log::{
 
 use super::Terminate;
 
-pub struct Init {
-    notify_rx: mpsc::Receiver<Event>,
-}
-
-pub async fn run(init: Init) {
-    supervisor_loop(init.notify_rx).await
-}
-
-pub struct Supervisor {
-    current_pid: ProcessId,
+pub struct SupervisorGenServer {
+    sup_tx: mpsc::Sender<Command>,
+    sup_rx: mpsc::Receiver<Command>,
     runtime_handle: Handle,
-    notify_tx: mpsc::Sender<Event>,
 }
 
-impl Supervisor {
-    pub fn new() -> (Supervisor, Init) {
-        Supervisor::with_runtime_handle(Handle::current())
+pub struct SupervisorPid {
+    sup_tx: mpsc::Sender<Command>,
+    runtime_handle: Handle,
+}
+
+impl SupervisorGenServer {
+    pub fn new() -> SupervisorGenServer {
+        SupervisorGenServer::with_runtime_handle(Handle::current())
     }
 
-    pub fn with_runtime_handle(runtime_handle: Handle) -> (Supervisor, Init) {
-        let (notify_tx, notify_rx) = mpsc::channel(0);
-        (
-            Supervisor {
-                current_pid: ProcessId::default(),
-                runtime_handle,
-                notify_tx,
-            },
-            Init { notify_rx, },
-        )
+    pub fn with_runtime_handle(runtime_handle: Handle) -> SupervisorGenServer {
+        let (sup_tx, sup_rx) = mpsc::channel(0);
+        SupervisorGenServer {
+            sup_tx,
+            sup_rx,
+            runtime_handle,
+        }
     }
 
-    pub fn runtime_handle(&self) -> &Handle {
-        &self.runtime_handle
+    pub fn pid(&self) -> SupervisorPid {
+        SupervisorPid {
+            sup_tx: self.sup_tx.clone(),
+            runtime_handle: self.runtime_handle.clone(),
+        }
     }
 
+    pub async fn run(self) {
+        supervisor_loop(self.sup_rx).await
+    }
+}
+
+impl SupervisorPid {
     pub fn spawn_link_permanent<F>(&mut self, future: F) where F: Future<Output = ()> + Send + 'static {
-        self.spawn_link(future, |pid| Event::PermanentProcessExited { pid, })
+        self.spawn_link(future, |pid| Command::PermanentProcessExited { pid, })
     }
 
     pub fn spawn_link_temporary<F>(&mut self, future: F) where F: Future<Output = ()> + Send + 'static {
-        self.spawn_link(future, |pid| Event::TemporaryProcessExited { pid, })
+        self.spawn_link(future, |pid| Command::TemporaryProcessExited { pid, })
     }
 
     fn spawn_link<F, E>(
@@ -71,42 +72,52 @@ impl Supervisor {
         report_exit: E,
     )
     where F: Future<Output = ()> + Send + 'static,
-          E: FnOnce(ProcessId) -> Event + Send + 'static,
+          E: FnOnce(ProcessId) -> Command + Send + 'static,
     {
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-
-        let pid = self.current_pid.incf();
-        let mut child_notify_tx = self.notify_tx.clone();
-
-        let future = async move {
-            let fused_future = future.fuse();
-            let mut fused_shutdown_rx = shutdown_rx.fuse();
-            pin_mut!(fused_future);
-
-            match child_notify_tx.send(Event::ProcessSpawned { pid, shutdown_tx, }).await {
-                Ok(()) => {
-                    select! {
-                        () = fused_future =>
-                            debug!("a process was terminated"),
-                        result = fused_shutdown_rx =>
-                            match result {
-                                Ok(Terminate(())) =>
-                                    debug!("a process was terminated (shutted down)"),
-                                Err(oneshot::Canceled) =>
-                                    debug!("a process was terminated (shutdown channel supervisor endpoint dropped)"),
-                            },
-                    };
-                    child_notify_tx
-                        .send(report_exit(pid))
-                        .await
-                        .ok();
-                },
-                Err(_send_error) =>
-                    warn!("supervisor is gone before child is actually spawned"),
-            }
-        };
-        self.runtime_handle.spawn(future);
+        let mut child_sup_tx = self.sup_tx.clone();
+        self.runtime_handle.spawn(async {
+            let _ = run_child(child_sup_tx, future, report_exit).await;
+        });
     }
+}
+
+async fn run_child<F, E>(
+    mut child_sup_tx: mpsc::Sender<Command>,
+    future: F,
+    report_exit: E,
+)
+    -> Result<(), ()>
+where F: Future<Output = ()> + Send + 'static,
+      E: FnOnce(ProcessId) -> Command + Send + 'static,
+{
+    let (init_tx, init_rx) = oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    child_sup_tx.send(Command::ProcessSpawned { init_tx, shutdown_tx, }).await
+        .map_err(|_send_error| warn!("supervisor is gone before child is actually spawned"))?;
+
+    let pid = init_rx.await
+        .map_err(|_send_error| warn!("supervisor is gone before child pid received"))?;
+
+    let fused_future = future.fuse();
+    let mut fused_shutdown_rx = shutdown_rx.fuse();
+
+    pin_mut!(fused_future);
+    select! {
+        () = fused_future =>
+            debug!("a process was terminated"),
+        result = fused_shutdown_rx =>
+            match result {
+                Ok(Terminate(())) =>
+                    debug!("a process was terminated (shutted down)"),
+                Err(oneshot::Canceled) =>
+                    debug!("a process was terminated (shutdown channel supervisor endpoint dropped)"),
+            },
+    };
+
+    child_sup_tx.send(report_exit(pid)).await.ok();
+
+    Ok(())
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash, Debug)]
@@ -122,45 +133,63 @@ impl ProcessId {
     }
 }
 
-enum Event {
-    ProcessSpawned { pid: ProcessId, shutdown_tx: oneshot::Sender<Terminate<()>>, },
+enum Command {
+    ProcessSpawned { init_tx: oneshot::Sender<ProcessId>, shutdown_tx: oneshot::Sender<Terminate<()>>, },
     PermanentProcessExited { pid: ProcessId, },
     TemporaryProcessExited { pid: ProcessId, },
 }
 
-async fn supervisor_loop(mut notify_rx: mpsc::Receiver<Event>) {
+async fn supervisor_loop(mut notify_rx: mpsc::Receiver<Command>) {
     debug!("supervisor loop started");
 
-    let mut children_txs = HashMap::new();
+    let mut children_txs: Vec<Option<oneshot::Sender<Terminate<()>>>> = Vec::new();
+    let mut free_cells = Vec::new();
 
-    while let Some(event) = notify_rx.next().await {
-        match event {
-            Event::ProcessSpawned { pid, shutdown_tx, } => {
+    while let Some(command) = notify_rx.next().await {
+        match command {
+            Command::ProcessSpawned { init_tx, shutdown_tx, } => {
+                let index = match free_cells.pop() {
+                    None => {
+                        let index = children_txs.len();
+                        children_txs.push(Some(shutdown_tx));
+                        index
+                    },
+                    Some(index) => {
+                        let prev_value = std::mem::replace(
+                            &mut children_txs[index],
+                            Some(shutdown_tx),
+                        );
+                        assert!(prev_value.is_none());
+                        index
+                    },
+                };
+                let pid = ProcessId { pid: index, };
                 debug!("a supervised process {:?} was spawned", pid);
-                children_txs.insert(pid, shutdown_tx);
             },
-            Event::PermanentProcessExited { pid, } => {
+            Command::PermanentProcessExited { pid, } => {
                 debug!("a permanent supervised process {:?} was terminated", pid);
-                if children_txs.remove(&pid).is_none() {
-                    warn!("something wrong: terminated permanent process {:?} was not supervised", pid);
-                } else {
-                    break;
-                }
+                let index = pid.pid;
+                children_txs[index].take().unwrap();
+                free_cells.push(index);
+                break;
             },
-            Event::TemporaryProcessExited { pid, } => {
+            Command::TemporaryProcessExited { pid, } => {
                 debug!("a temporary supervised process {:?} was terminated", pid);
-                if children_txs.remove(&pid).is_none() {
-                    warn!("something wrong: terminated temporary process {:?} was not supervised", pid);
-                }
+                let index = pid.pid;
+                children_txs[index].take().unwrap();
+                free_cells.push(index);
             },
         }
     }
 
     debug!("supervisor shutdown: terminating {} linked processes", children_txs.len());
 
-    for (pid, shutdown_tx) in children_txs {
-        if let Err(..) = shutdown_tx.send(Terminate(())) {
-            debug!("supervised process {:?} is gone while performing shutdown", pid);
+    for (index, maybe_shutdown_tx) in children_txs.into_iter().enumerate() {
+        if let Some(shutdown_tx) = maybe_shutdown_tx {
+            let pid = ProcessId { pid: index, };
+            if let Err(..) = shutdown_tx.send(Terminate(())) {
+                debug!("supervised process {:?} is gone while performing shutdown", pid);
+            }
         }
     }
 }
