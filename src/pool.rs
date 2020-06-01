@@ -29,26 +29,14 @@ use super::{
     ErrorSeverity,
 };
 
-#[derive(Clone)]
-pub struct Pool<MT> {
+pub struct PoolGenServer<MT> {
     tasks_tx: mpsc::Sender<MT>,
-}
-
-pub struct Init<MT, MN, BMS, MB, C, SB, H, I> {
-    state: State<MT, MN, BMS, MB, C, SB, H, I>,
-    supervisor: supervisor::Supervisor,
-    supervisor_init: supervisor::Init,
-}
-
-pub struct State<MT, MN, BMS, MB, C, SB, H, I> {
     fused_tasks_rx: stream::Fuse<mpsc::Receiver<MT>>,
-    master_params: Params<MN>,
-    master_init_state: BMS,
-    master_bootstrap: MB,
-    master_converter: C,
-    slaves_bootstrap: SB,
-    slaves_handler: H,
-    slaves_iter: I,
+}
+
+#[derive(Clone)]
+pub struct PoolPid<MT> {
+    tasks_tx: mpsc::Sender<MT>,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -56,9 +44,25 @@ pub enum PushTaskError {
     BackgroundTaskGone,
 }
 
-impl<MT> Pool<MT> {
-    pub fn new<MN, BMS, MB, C, SB, H, I>(
-        parent_supervisor: &mut supervisor::Supervisor,
+impl<MT> PoolGenServer<MT> {
+    pub fn new() -> PoolGenServer<MT> {
+        let (tasks_tx, tasks_rx) = mpsc::channel(0);
+
+        PoolGenServer {
+            tasks_tx,
+            fused_tasks_rx: tasks_rx.fuse(),
+        }
+    }
+
+    pub fn pid(&self) -> PoolPid<MT> {
+        PoolPid {
+            tasks_tx: self.tasks_tx.clone(),
+        }
+    }
+
+    pub async fn run<MN, SN, MB, FMB, EMB, BMS, MS, C, FC, EC, SB, FSB, ESB, BSS, SS, H, FH, EH, ST, I>(
+        self,
+        parent_supervisor: &supervisor::SupervisorPid,
         master_params: Params<MN>,
         master_init_state: BMS,
         master_bootstrap: MB,
@@ -67,141 +71,108 @@ impl<MT> Pool<MT> {
         slaves_handler: H,
         slaves_iter: I,
     )
-        -> (Pool<MT>, Init<MT, MN, BMS, MB, C, SB, H, I>)
-    {
-        let (supervisor, supervisor_init) =
-            supervisor::Supervisor::with_runtime_handle(parent_supervisor.runtime_handle().clone());
-        let (tasks_tx, tasks_rx) = mpsc::channel(0);
+    where MN: AsRef<str> + Send + 'static,
+          SN: AsRef<str> + Send + 'static,
+          MB: Fn(BMS) -> FMB + Send + Sync + 'static,
+          FMB: Future<Output = Result<MS, ErrorSeverity<BMS, EMB>>> + Send,
+          BMS: Send + 'static,
+          EMB: Debug + Send,
+          C: Fn(MT, MS) -> FC + Send + Sync + 'static,
+          FC: Future<Output = Result<(ST, MS), ErrorSeverity<BMS, EC>>> + Send,
+          MS: Send,
+          EC: Debug + Send,
+          SB: Fn(BSS) -> FSB + Send + Sync + 'static,
+          BSS: Send + 'static,
+          FSB: Future<Output = Result<SS, ErrorSeverity<BSS, ESB>>> + Send,
+          ESB: Debug + Send,
+          H: Fn(ST, SS) -> FH + Send + Sync + 'static,
+          SS: Send,
+          FH: Future<Output = Result<SS, ErrorSeverity<BSS, EH>>> + Send,
+          EH: Debug + Send,
+          MT: Send + 'static,
+          ST: Send + 'static,
+          I: IntoIterator<Item = (Params<SN>, BSS)>,
 
-        (
-            Pool {
-                tasks_tx,
-            },
-            Init {
-                state: State {
-                    fused_tasks_rx: tasks_rx.fuse(),
-                    master_params,
-                    master_init_state,
-                    master_bootstrap,
-                    master_converter,
-                    slaves_bootstrap,
-                    slaves_handler,
-                    slaves_iter,
-                },
-                supervisor,
-                supervisor_init,
-            },
-        )
+    {
+        let supervisor_gen_server =
+            parent_supervisor.child_supevisor();
+        let mut supervisor = supervisor_gen_server.pid();
+
+        let (slaves_tx, slaves_rx) = mpsc::channel(0);
+        let fused_tasks_rx = self.fused_tasks_rx;
+        supervisor.spawn_link_permanent(async move {
+            let master_result = run_master(
+                master_params,
+                master_init_state,
+                master_bootstrap,
+                fused_tasks_rx,
+                slaves_rx.fuse(),
+                master_converter,
+            ).await;
+            match master_result {
+                Ok(()) =>
+                    (),
+                Err(MasterError::Bootstrap(error)) =>
+                    error!("state bootstrap error in master: {:?}", error),
+                Err(MasterError::Converter(error)) =>
+                    error!("tasks converter error in master: {:?}", error),
+                Err(MasterError::TasksChannelDropped) =>
+                    error!("tasks channel dropped in master"),
+                Err(MasterError::TasksChannelDepleted) =>
+                    info!("tasks channel depleted in master"),
+                Err(MasterError::SlavesChannelDropped) =>
+                    error!("slaves channel dropped in master"),
+                Err(MasterError::SlavesChannelDepleted) =>
+                    info!("slaves channel depleted in master"),
+                Err(MasterError::SlaveTaskChannelDropped) =>
+                    error!("slave task channel dropped in master"),
+                Err(MasterError::CrashForced) =>
+                    info!("crash forced after error in master"),
+            }
+        });
+
+        let shared_bootstrap = Arc::new(slaves_bootstrap);
+        let shared_handler = Arc::new(slaves_handler);
+
+        for (params, init_state) in slaves_iter {
+            let bootstrap = shared_bootstrap.clone();
+            let handler = shared_handler.clone();
+            let slaves_tx = slaves_tx.clone();
+            supervisor.spawn_link_permanent(async move {
+                let slave_result = run_slave(
+                    params,
+                    init_state,
+                    move |state| bootstrap(state),
+                    slaves_tx,
+                    move |task, state| handler(task, state),
+                ).await;
+                match slave_result {
+                    Ok(()) =>
+                        (),
+                    Err(SlaveError::Bootstrap(error)) =>
+                        error!("state bootstrap error in slave: {:?}", error),
+                    Err(SlaveError::Handler(error)) =>
+                        error!("task handler error in slave: {:?}", error),
+                    Err(SlaveError::MasterChannelDropped) =>
+                        error!("master channel dropped in slave"),
+                    Err(SlaveError::TasksChannelDropped) =>
+                        error!("tasks channel dropped in slave"),
+                    Err(SlaveError::CrashForced) =>
+                        info!("crash forced after error in slave"),
+                }
+            });
+        }
+
+        supervisor_gen_server.run().await
     }
 
+}
+
+impl<MT> PoolPid<MT> {
     pub async fn push_task(&mut self, task: MT) -> Result<(), PushTaskError> {
         self.tasks_tx.send(task).await
             .map_err(|_send_error| PushTaskError::BackgroundTaskGone)
     }
-}
-
-pub async fn run<MN, SN, MB, FMB, EMB, BMS, MS, C, FC, EC, SB, FSB, ESB, BSS, SS, H, FH, EH, MT, ST, I>(
-    init: Init<MT, MN, BMS, MB, C, SB, H, I>,
-)
-where MN: AsRef<str> + Send + 'static,
-      SN: AsRef<str> + Send + 'static,
-      MB: Fn(BMS) -> FMB + Send + Sync + 'static,
-      FMB: Future<Output = Result<MS, ErrorSeverity<BMS, EMB>>> + Send,
-      BMS: Send + 'static,
-      EMB: Debug + Send,
-      C: Fn(MT, MS) -> FC + Send + Sync + 'static,
-      FC: Future<Output = Result<(ST, MS), ErrorSeverity<BMS, EC>>> + Send,
-      MS: Send,
-      EC: Debug + Send,
-      SB: Fn(BSS) -> FSB + Send + Sync + 'static,
-      BSS: Send + 'static,
-      FSB: Future<Output = Result<SS, ErrorSeverity<BSS, ESB>>> + Send,
-      ESB: Debug + Send,
-      H: Fn(ST, SS) -> FH + Send + Sync + 'static,
-      SS: Send,
-      FH: Future<Output = Result<SS, ErrorSeverity<BSS, EH>>> + Send,
-      EH: Debug + Send,
-      MT: Send + 'static,
-      ST: Send + 'static,
-      I: IntoIterator<Item = (Params<SN>, BSS)>,
-{
-    let (slaves_tx, slaves_rx) = mpsc::channel(0);
-    let Init { state, mut supervisor, supervisor_init } = init;
-    let State {
-        fused_tasks_rx,
-        master_params,
-        master_init_state,
-        master_bootstrap,
-        master_converter,
-        slaves_bootstrap,
-        slaves_handler,
-        slaves_iter,
-    } = state;
-
-    supervisor.spawn_link_permanent(async move {
-        let master_result = run_master(
-            master_params,
-            master_init_state,
-            master_bootstrap,
-            fused_tasks_rx,
-            slaves_rx.fuse(),
-            master_converter,
-        ).await;
-        match master_result {
-            Ok(()) =>
-                (),
-            Err(MasterError::Bootstrap(error)) =>
-                error!("state bootstrap error in master: {:?}", error),
-            Err(MasterError::Converter(error)) =>
-                error!("tasks converter error in master: {:?}", error),
-            Err(MasterError::TasksChannelDropped) =>
-                error!("tasks channel dropped in master"),
-            Err(MasterError::TasksChannelDepleted) =>
-                info!("tasks channel depleted in master"),
-            Err(MasterError::SlavesChannelDropped) =>
-                error!("slaves channel dropped in master"),
-            Err(MasterError::SlavesChannelDepleted) =>
-                info!("slaves channel depleted in master"),
-            Err(MasterError::SlaveTaskChannelDropped) =>
-                error!("slave task channel dropped in master"),
-            Err(MasterError::CrashForced) =>
-                info!("crash forced after error in master"),
-        }
-    });
-
-    let shared_bootstrap = Arc::new(slaves_bootstrap);
-    let shared_handler = Arc::new(slaves_handler);
-
-    for (params, init_state) in slaves_iter {
-        let bootstrap = shared_bootstrap.clone();
-        let handler = shared_handler.clone();
-        let slaves_tx = slaves_tx.clone();
-        supervisor.spawn_link_permanent(async move {
-            let slave_result = run_slave(
-                params,
-                init_state,
-                move |state| bootstrap(state),
-                slaves_tx,
-                move |task, state| handler(task, state),
-            ).await;
-            match slave_result {
-                Ok(()) =>
-                    (),
-                Err(SlaveError::Bootstrap(error)) =>
-                    error!("state bootstrap error in slave: {:?}", error),
-                Err(SlaveError::Handler(error)) =>
-                    error!("task handler error in slave: {:?}", error),
-                Err(SlaveError::MasterChannelDropped) =>
-                    error!("master channel dropped in slave"),
-                Err(SlaveError::TasksChannelDropped) =>
-                    error!("tasks channel dropped in slave"),
-                Err(SlaveError::CrashForced) =>
-                    info!("crash forced after error in slave"),
-            }
-        });
-    }
-
-    supervisor::run(supervisor_init).await
 }
 
 #[derive(Debug)]

@@ -3,7 +3,6 @@ use std::time::Duration;
 pub mod supervisor;
 pub mod restart;
 pub mod pool;
-// pub mod net;
 mod macros;
 
 pub enum ErrorSeverity<S, A> {

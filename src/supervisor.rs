@@ -66,6 +66,10 @@ impl SupervisorPid {
         self.spawn_link(future, |pid| Command::TemporaryProcessExited { pid, })
     }
 
+    pub fn child_supevisor(&self) -> SupervisorGenServer {
+        SupervisorGenServer::with_runtime_handle(self.runtime_handle.clone())
+    }
+
     fn spawn_link<F, E>(
         &mut self,
         future: F,
@@ -74,7 +78,7 @@ impl SupervisorPid {
     where F: Future<Output = ()> + Send + 'static,
           E: FnOnce(ProcessId) -> Command + Send + 'static,
     {
-        let mut child_sup_tx = self.sup_tx.clone();
+        let child_sup_tx = self.sup_tx.clone();
         self.runtime_handle.spawn(async {
             let _ = run_child(child_sup_tx, future, report_exit).await;
         });
@@ -125,14 +129,6 @@ struct ProcessId {
     pid: usize,
 }
 
-impl ProcessId {
-    fn incf(&mut self) -> ProcessId {
-        let old = self.clone();
-        self.pid += 1;
-        old
-    }
-}
-
 enum Command {
     ProcessSpawned { init_tx: oneshot::Sender<ProcessId>, shutdown_tx: oneshot::Sender<Terminate<()>>, },
     PermanentProcessExited { pid: ProcessId, },
@@ -164,6 +160,9 @@ async fn supervisor_loop(mut notify_rx: mpsc::Receiver<Command>) {
                     },
                 };
                 let pid = ProcessId { pid: index, };
+                if let Err(_send_error) = init_tx.send(pid) {
+                    warn!("supervised task has gone before PID is sent");
+                }
                 debug!("a supervised process {:?} was spawned", pid);
             },
             Command::PermanentProcessExited { pid, } => {
