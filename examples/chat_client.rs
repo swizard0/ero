@@ -139,9 +139,14 @@ impl StdioGenServer {
                             info!("stdin depleted, terminating");
                             return Ok(());
                         },
-                        Req::Input(Some(Line(line))) => {
+                        Req::Input(Some(Line(mut line))) => {
+                            line.push('\n');
                             if let Err(error) = stdout.write_all(line.as_bytes()).await {
                                 error!("stdout write error: {:?}, restarting", error);
+                                return Err(ErrorSeverity::Recoverable { state: (fused_external_rx, network_pid), });
+                            }
+                            if let Err(error) = stdout.flush().await {
+                                error!("stdout flush error: {:?}, restarting", error);
                                 return Err(ErrorSeverity::Recoverable { state: (fused_external_rx, network_pid), });
                             }
                         },
@@ -224,6 +229,8 @@ impl NetworkGenServer {
                 let mut fused_tcp_read = io::BufReader::new(tcp_read)
                     .lines()
                     .fuse();
+
+                info!("connected to {:?}!", connect_addr);
                 loop {
                     enum Req {
                         TcpRead(Option<Result<String, IoError>>),
@@ -250,9 +257,14 @@ impl NetworkGenServer {
                             info!("tcp socket closed, restarting");
                             return Err(ErrorSeverity::Recoverable { state: (fused_external_rx, connect_addr, stdio_pid), });
                         },
-                        Req::Input(Some(Line(line))) => {
+                        Req::Input(Some(Line(mut line))) => {
+                            line.push('\n');
                             if let Err(error) = tcp_write.write_all(line.as_bytes()).await {
                                 error!("tcp write failed: {:?}, restarting", error);
+                                return Err(ErrorSeverity::Recoverable { state: (fused_external_rx, connect_addr, stdio_pid), });
+                            }
+                            if let Err(error) = tcp_write.flush().await {
+                                error!("tcp flush failed: {:?}, restarting", error);
                                 return Err(ErrorSeverity::Recoverable { state: (fused_external_rx, connect_addr, stdio_pid), });
                             }
                         },
