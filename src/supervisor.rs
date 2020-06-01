@@ -26,6 +26,7 @@ pub struct SupervisorGenServer {
     runtime_handle: Handle,
 }
 
+#[derive(Clone)]
 pub struct SupervisorPid {
     sup_tx: mpsc::Sender<Command>,
     runtime_handle: Handle,
