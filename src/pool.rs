@@ -62,7 +62,7 @@ impl<MT> PoolGenServer<MT> {
 
     pub async fn run<MN, SN, MB, FMB, EMB, BMS, MS, C, FC, EC, SB, FSB, ESB, BSS, SS, H, FH, EH, ST, I>(
         self,
-        parent_supervisor: &supervisor::SupervisorPid,
+        parent_supervisor: supervisor::SupervisorPid,
         master_params: Params<MN>,
         master_init_state: BMS,
         master_bootstrap: MB,
