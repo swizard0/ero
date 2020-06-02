@@ -39,11 +39,6 @@ pub struct PoolPid<MT> {
     tasks_tx: mpsc::Sender<MT>,
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum PushTaskError {
-    BackgroundTaskGone,
-}
-
 impl<MT> PoolGenServer<MT> {
     pub fn new() -> PoolGenServer<MT> {
         let (tasks_tx, tasks_rx) = mpsc::channel(0);
@@ -166,6 +161,11 @@ impl<MT> PoolGenServer<MT> {
         supervisor_gen_server.run().await
     }
 
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum PushTaskError {
+    BackgroundTaskGone,
 }
 
 impl<MT> PoolPid<MT> {
