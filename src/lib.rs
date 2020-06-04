@@ -18,6 +18,9 @@ pub enum RestartStrategy {
 
 pub struct Terminate<R>(pub R);
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct NoProcError;
+
 pub struct Params<N> {
     pub name: N,
     pub restart_strategy: RestartStrategy,
