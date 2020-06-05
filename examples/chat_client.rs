@@ -31,6 +31,7 @@ use log::{
 
 use ero::{
     restart,
+    NoProcError,
     ErrorSeverity,
     RestartStrategy,
     supervisor::SupervisorGenServer,
@@ -129,7 +130,9 @@ impl StdioGenServer {
                     match req {
                         Req::Stdin(Some(Ok(line))) => {
                             debug!("STDIN: here comes a line: {:?}", line);
-                            network_pid.send_line(Line(line)).await;
+                            if let Err(NoProcError) = network_pid.send_line(Line(line)).await {
+                                return Ok(());
+                            }
                         },
                         Req::Stdin(Some(Err(error))) => {
                             error!("stdin read error: {:?}, terminating", error);
@@ -170,10 +173,12 @@ impl StdioGenServer {
 }
 
 impl StdioPid {
-    pub async fn display_line(&mut self, line: Line) {
-        if let Err(_send_error) = self.external_tx.send(line).await {
-            warn!("stdio gen_server has gone while sending line");
-        }
+    pub async fn display_line(&mut self, line: Line) -> Result<(), NoProcError> {
+        self.external_tx.send(line).await
+            .map_err(|_send_error| {
+                warn!("stdio gen_server has gone while sending line");
+                NoProcError
+            })
     }
 }
 
@@ -247,7 +252,9 @@ impl NetworkGenServer {
                     match req {
                         Req::TcpRead(Some(Ok(line))) => {
                             debug!("TCP: here comes a line: {:?}", line);
-                            stdio_pid.display_line(Line(line)).await;
+                            if let Err(NoProcError) = stdio_pid.display_line(Line(line)).await {
+                                return Ok(());
+                            }
                         },
                         Req::TcpRead(Some(Err(error))) => {
                             error!("tcp read failed: {:?}, restarting", error);
@@ -288,9 +295,11 @@ impl NetworkGenServer {
 }
 
 impl NetworkPid {
-    pub async fn send_line(&mut self, line: Line) {
-        if let Err(_send_error) = self.external_tx.send(line).await {
-            warn!("network gen_server has gone while sending line");
-        }
+    pub async fn send_line(&mut self, line: Line) -> Result<(), NoProcError> {
+        self.external_tx.send(line).await
+            .map_err(|_send_error| {
+                warn!("network gen_server has gone while sending line");
+                NoProcError
+            })
     }
 }

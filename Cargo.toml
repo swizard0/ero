@@ -1,6 +1,6 @@
 [package]
 name = "ero"
-version = "0.13.1"
+version = "0.13.2"
 authors = ["Alexey Voznyuk <me@swizard.info>"]
 description = "Erlang-inspired framework for organizing async code in a fault-tolerant way"
 edition = "2018"
