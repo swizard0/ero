@@ -26,6 +26,7 @@ use super::{
     supervisor,
     restart,
     Params,
+    NoProcError,
     ErrorSeverity,
 };
 
@@ -163,15 +164,10 @@ impl<MT> PoolGenServer<MT> {
 
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum PushTaskError {
-    BackgroundTaskGone,
-}
-
 impl<MT> PoolPid<MT> {
-    pub async fn push_task(&mut self, task: MT) -> Result<(), PushTaskError> {
+    pub async fn push_task(&mut self, task: MT) -> Result<(), NoProcError> {
         self.tasks_tx.send(task).await
-            .map_err(|_send_error| PushTaskError::BackgroundTaskGone)
+            .map_err(|_send_error| NoProcError)
     }
 }
 
