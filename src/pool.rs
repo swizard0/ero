@@ -91,7 +91,7 @@ impl<MT> PoolGenServer<MT> {
 
     {
         let supervisor_gen_server =
-            parent_supervisor.child_supevisor();
+            parent_supervisor.child_supervisor();
         let mut supervisor = supervisor_gen_server.pid();
 
         let (slaves_tx, slaves_rx) = mpsc::channel(0);
