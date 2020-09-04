@@ -67,7 +67,12 @@ impl SupervisorPid {
         self.spawn_link(future, |pid| Command::TemporaryProcessExited { pid, })
     }
 
+    #[deprecated = "rename fn. Use child_supervisor"]
     pub fn child_supevisor(&self) -> SupervisorGenServer {
+        SupervisorGenServer::with_runtime_handle(self.runtime_handle.clone())
+    }
+
+    pub fn child_supervisor(&self) -> SupervisorGenServer {
         SupervisorGenServer::with_runtime_handle(self.runtime_handle.clone())
     }
 
