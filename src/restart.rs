@@ -1,6 +1,6 @@
 use futures::Future;
 
-use tokio::time::delay_for;
+use tokio::time::sleep;
 
 use log::{
     debug,
@@ -47,7 +47,7 @@ where R: FnMut(S) -> F,
                     },
                     RestartStrategy::Delay { restart_after, } => {
                         info!("recoverable error in {}, restarting in {:?}", params.name.as_ref(), restart_after);
-                        delay_for(restart_after).await;
+                        sleep(restart_after).await;
                         init_state = state;
                     },
                 },

@@ -11,8 +11,6 @@ use futures::{
     pin_mut,
 };
 
-use tokio::runtime::Handle;
-
 use log::{
     warn,
     debug,
@@ -23,33 +21,22 @@ use super::Terminate;
 pub struct SupervisorGenServer {
     sup_tx: mpsc::Sender<Command>,
     sup_rx: mpsc::Receiver<Command>,
-    runtime_handle: Handle,
 }
 
 #[derive(Clone)]
 pub struct SupervisorPid {
     sup_tx: mpsc::Sender<Command>,
-    runtime_handle: Handle,
 }
 
 impl SupervisorGenServer {
     pub fn new() -> SupervisorGenServer {
-        SupervisorGenServer::with_runtime_handle(Handle::current())
-    }
-
-    pub fn with_runtime_handle(runtime_handle: Handle) -> SupervisorGenServer {
         let (sup_tx, sup_rx) = mpsc::channel(0);
-        SupervisorGenServer {
-            sup_tx,
-            sup_rx,
-            runtime_handle,
-        }
+        SupervisorGenServer { sup_tx, sup_rx, }
     }
 
     pub fn pid(&self) -> SupervisorPid {
         SupervisorPid {
             sup_tx: self.sup_tx.clone(),
-            runtime_handle: self.runtime_handle.clone(),
         }
     }
 
@@ -68,7 +55,7 @@ impl SupervisorPid {
     }
 
     pub fn child_supevisor(&self) -> SupervisorGenServer {
-        SupervisorGenServer::with_runtime_handle(self.runtime_handle.clone())
+        SupervisorGenServer::new()
     }
 
     fn spawn_link<F, E>(
@@ -80,7 +67,7 @@ impl SupervisorPid {
           E: FnOnce(ProcessId) -> Command + Send + 'static,
     {
         let child_sup_tx = self.sup_tx.clone();
-        self.runtime_handle.spawn(async {
+        tokio::spawn(async {
             let _ = run_child(child_sup_tx, future, report_exit).await;
         });
     }
