@@ -54,7 +54,7 @@ impl SupervisorPid {
         self.spawn_link(future, |pid| Command::TemporaryProcessExited { pid, })
     }
 
-    pub fn child_supevisor(&self) -> SupervisorGenServer {
+    pub fn child_supervisor(&self) -> SupervisorGenServer {
         SupervisorGenServer::new()
     }
 
