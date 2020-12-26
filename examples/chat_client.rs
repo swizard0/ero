@@ -6,6 +6,7 @@ use std::{
 use futures::{
     select,
     channel::mpsc,
+    FutureExt,
     StreamExt,
     SinkExt,
 };
@@ -110,35 +111,34 @@ impl StdioGenServer {
             |(mut fused_external_rx, mut network_pid)| async move {
                 let stdin = io::stdin();
                 let mut stdout = io::stdout();
-                let mut fused_stdin = io::BufReader::new(stdin)
-                    .lines()
-                    .fuse();
+                let mut stdin = io::BufReader::new(stdin)
+                    .lines();
 
                 loop {
                     enum Req {
-                        Stdin(Option<Result<String, IoError>>),
+                        Stdin(Result<Option<String>, IoError>),
                         Input(Option<Line>),
                     }
 
                     let req = select! {
-                        result = fused_stdin.next() =>
+                        result = stdin.next_line().fuse() =>
                             Req::Stdin(result),
                         result = fused_external_rx.next() =>
                             Req::Input(result),
                     };
 
                     match req {
-                        Req::Stdin(Some(Ok(line))) => {
+                        Req::Stdin(Ok(Some(line))) => {
                             debug!("STDIN: here comes a line: {:?}", line);
                             if let Err(NoProcError) = network_pid.send_line(Line(line)).await {
                                 return Ok(());
                             }
                         },
-                        Req::Stdin(Some(Err(error))) => {
+                        Req::Stdin(Err(error)) => {
                             error!("stdin read error: {:?}, terminating", error);
                             return Err(ErrorSeverity::Fatal(()));
                         },
-                        Req::Stdin(None) => {
+                        Req::Stdin(Ok(None)) => {
                             info!("stdin depleted, terminating");
                             return Ok(());
                         },
@@ -231,36 +231,35 @@ impl NetworkGenServer {
                     },
                 };
                 let (tcp_read, mut tcp_write) = stream.split();
-                let mut fused_tcp_read = io::BufReader::new(tcp_read)
-                    .lines()
-                    .fuse();
+                let mut tcp_read = io::BufReader::new(tcp_read)
+                    .lines();
 
                 info!("connected to {:?}!", connect_addr);
                 loop {
                     enum Req {
-                        TcpRead(Option<Result<String, IoError>>),
+                        TcpRead(Result<Option<String>, IoError>),
                         Input(Option<Line>),
                     }
 
                     let req = select! {
-                        result = fused_tcp_read.next() =>
+                        result = tcp_read.next_line().fuse() =>
                             Req::TcpRead(result),
                         result = fused_external_rx.next() =>
                             Req::Input(result),
                     };
 
                     match req {
-                        Req::TcpRead(Some(Ok(line))) => {
+                        Req::TcpRead(Ok(Some(line))) => {
                             debug!("TCP: here comes a line: {:?}", line);
                             if let Err(NoProcError) = stdio_pid.display_line(Line(line)).await {
                                 return Ok(());
                             }
                         },
-                        Req::TcpRead(Some(Err(error))) => {
+                        Req::TcpRead(Err(error)) => {
                             error!("tcp read failed: {:?}, restarting", error);
                             return Err(ErrorSeverity::Recoverable { state: (fused_external_rx, connect_addr, stdio_pid), });
                         },
-                        Req::TcpRead(None) => {
+                        Req::TcpRead(Ok(None)) => {
                             info!("tcp socket closed, restarting");
                             return Err(ErrorSeverity::Recoverable { state: (fused_external_rx, connect_addr, stdio_pid), });
                         },

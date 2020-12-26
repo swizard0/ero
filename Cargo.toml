@@ -1,6 +1,6 @@
 [package]
 name = "ero"
-version = "0.14.2"
+version = "0.14.3"
 authors = ["Alexey Voznyuk <me@swizard.info>"]
 description = "Erlang-inspired framework for organizing async code in a fault-tolerant way"
 edition = "2018"
@@ -8,7 +8,7 @@ edition = "2018"
 [dependencies]
 log = "0.4"
 futures = "^0.3"
-tokio = { version = "^0.3", features = ["full"] }
+tokio = { version = "^1.0", features = ["full"] }
 
 [dev-dependencies]
 pretty_env_logger = "0.4"
