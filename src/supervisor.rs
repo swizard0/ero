@@ -54,6 +54,22 @@ impl SupervisorPid {
         self.spawn_link(future, |pid| Command::TemporaryProcessExited { pid, })
     }
 
+    pub fn spawn_link_permanent_in<F>(&mut self, handle: &tokio::runtime::Handle, future: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.spawn_link_in(handle, future, |pid| Command::PermanentProcessExited {
+            pid,
+        })
+    }
+
+    pub fn spawn_link_temporary_in<F>(&mut self, handle: &tokio::runtime::Handle, future: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.spawn_link_in(handle, future, |pid| Command::TemporaryProcessExited { pid })
+    }
+
     pub fn child_supervisor(&self) -> SupervisorGenServer {
         SupervisorGenServer::new()
     }
@@ -68,6 +84,17 @@ impl SupervisorPid {
     {
         let child_sup_tx = self.sup_tx.clone();
         tokio::spawn(async {
+            let _ = run_child(child_sup_tx, future, report_exit).await;
+        });
+    }
+
+    fn spawn_link_in<F, E>(&mut self, handle: &tokio::runtime::Handle, future: F, report_exit: E)
+    where
+        F: Future<Output = ()> + Send + 'static,
+        E: FnOnce(ProcessId) -> Command + Send + 'static,
+    {
+        let child_sup_tx = self.sup_tx.clone();
+        handle.spawn(async {
             let _ = run_child(child_sup_tx, future, report_exit).await;
         });
     }
