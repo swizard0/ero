@@ -35,9 +35,16 @@ pub struct PoolGenServer<MT> {
     fused_tasks_rx: stream::Fuse<mpsc::Receiver<MT>>,
 }
 
-#[derive(Clone)]
 pub struct PoolPid<MT> {
     tasks_tx: mpsc::Sender<MT>,
+}
+
+impl<MT> Clone for PoolPid<MT> {
+    fn clone(&self) -> Self {
+        PoolPid {
+            tasks_tx: self.tasks_tx.clone(),
+        }
+    }
 }
 
 impl<MT> PoolGenServer<MT> {
