@@ -47,6 +47,12 @@ impl<MT> Clone for PoolPid<MT> {
     }
 }
 
+impl<MT> From<PoolPid<MT>> for mpsc::Sender<MT> {
+    fn from(other: PoolPid<MT>) -> Self {
+        other.tasks_tx
+    }
+}
+
 impl<MT> PoolGenServer<MT> {
     pub fn new() -> PoolGenServer<MT> {
         let (tasks_tx, tasks_rx) = mpsc::channel(0);
