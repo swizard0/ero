@@ -47,17 +47,20 @@ async fn main() {
 
     // Создаем супервизор
     let supervisor_gen_server = SupervisorGenServer::new();
-
+    // Получаем канал для общения с супервизором
     let mut supervisor_pid = supervisor_gen_server.pid();
 
+    // Создаем актор по работе с stdin
     info!("creating stdio gen_server");
     let stdio_gen_server = StdioGenServer::new();
     let stdio_pid = stdio_gen_server.pid();
 
+    // Создаем актор по работе с сетевым сокетом
     info!("creating network gen_server");
     let network_gen_server = NetworkGenServer::new();
     let network_pid = network_gen_server.pid();
 
+    // Стартуем актор работы со stdin под супервизором
     supervisor_pid.spawn_link_permanent(stdio_gen_server.run(
         ero::Params {
             name: "chat_client stdio",
@@ -66,6 +69,7 @@ async fn main() {
         network_pid,
     ));
 
+    // Стартуем актор работы с сетевым сокетом под супервизором
     supervisor_pid.spawn_link_permanent(network_gen_server.run(
         ero::Params {
             name: "chat_client network",
@@ -371,8 +375,10 @@ struct NetworkPid {
     external_tx: mpsc::Sender<Line>,
 }
 
-
 impl NetworkPid {
+    /// Пишем какое-то сообщение в [NetworkGenServer]
+    /// 
+    /// Выполнение не идет дальше до вычитывания так как используется канал размером буффера 0
     pub async fn send_line(&mut self, line: Line) -> Result<(), NoProcError> {
         self.external_tx.send(line).await
             .map_err(|_send_error| {
