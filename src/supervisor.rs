@@ -18,31 +18,44 @@ use log::{
 
 use super::Terminate;
 
+/// Супервизор актора
 pub struct SupervisorGenServer {
     sup_tx: mpsc::Sender<Command>,
     sup_rx: mpsc::Receiver<Command>,
 }
 
-#[derive(Clone)]
-pub struct SupervisorPid {
-    sup_tx: mpsc::Sender<Command>,
-}
-
-impl SupervisorGenServer {
-    pub fn new() -> SupervisorGenServer {
+impl Default for SupervisorGenServer {
+    fn default() -> Self {
         let (sup_tx, sup_rx) = mpsc::channel(0);
         SupervisorGenServer { sup_tx, sup_rx, }
     }
+}
 
+impl SupervisorGenServer {
+    /// Создаем новый экземпляр
+    pub fn new() -> SupervisorGenServer {
+        Self::default()
+    }
+
+    /// Получаем PID для управления
     pub fn pid(&self) -> SupervisorPid {
         SupervisorPid {
             sup_tx: self.sup_tx.clone(),
         }
     }
 
+    /// Запускаем цикл работы и ждем его завершения
     pub async fn run(self) {
         supervisor_loop(self.sup_rx).await
     }
+}
+
+/////////////////////////////////////////////////////////////////////////////////////
+
+/// Канал для контроля супервизора
+#[derive(Clone)]
+pub struct SupervisorPid {
+    sup_tx: mpsc::Sender<Command>,
 }
 
 impl SupervisorPid {
