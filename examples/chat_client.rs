@@ -64,6 +64,7 @@ async fn main() {
     supervisor_pid.spawn_link_permanent(stdio_gen_server.run(
         ero::Params {
             name: "chat_client stdio",
+            // Рестартовать будем сразу же
             restart_strategy: RestartStrategy::RestartImmediately,
         },
         network_pid,
@@ -73,6 +74,7 @@ async fn main() {
     supervisor_pid.spawn_link_permanent(network_gen_server.run(
         ero::Params {
             name: "chat_client network",
+            // Рестартовать будем c небольшой задержкой
             restart_strategy: RestartStrategy::Delay {
                 restart_after: Duration::from_secs(8),
             },
@@ -81,6 +83,7 @@ async fn main() {
         stdio_pid,
     ));
 
+    // Стартуем супервизор и ждем завершения всех работ
     supervisor_gen_server.run().await;
 }
 

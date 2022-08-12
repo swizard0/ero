@@ -13,6 +13,7 @@ use super::{
     RestartStrategy,
 };
 
+/// Ошибка при рестарте
 #[derive(Clone, PartialEq, Debug)]
 pub enum RestartableError<E> {
     Fatal(E),

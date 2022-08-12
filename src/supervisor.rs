@@ -13,8 +13,7 @@ use futures::{
 
 use log::{
     warn,
-    debug,
-    error,
+    debug
 };
 
 use super::Terminate;
@@ -266,9 +265,14 @@ async fn supervisor_loop(mut notify_rx: mpsc::Receiver<Command>) {
 
     debug!("supervisor shutdown: terminating {} linked processes", children_txs.len());
 
+    // Идем по всем дочерним каналам
     for (index, maybe_shutdown_tx) in children_txs.into_iter().enumerate() {
+        // Если канал есть
         if let Some(shutdown_tx) = maybe_shutdown_tx {
+            // Берем идентификатор процесса в виде индекса в массиве
             let pid = ProcessId { pid: index, };
+            // Отправляем в канал событие завершения
+            // TODO: Нужно
             if let Err(..) = shutdown_tx.send(Terminate(())) {
                 debug!("supervised process {:?} is gone while performing shutdown", pid);
             }
@@ -282,21 +286,15 @@ fn process_finish(
     children_txs: &mut [Option<oneshot::Sender<Terminate<()>>>], 
     free_cells: &mut Vec<usize>
 ) {
-    
-    // Здесь не паникуем, а пишем ошибки, так как работа происходит с внешними сервисами.
-    
     let index = pid.pid;
 
-    // Ищем по нужному индексу
-    if let Some(child) = children_txs.get_mut(index){
-        // Извлекаем элемент и делаем его None
-        if child.take().is_some() {
-            // При этом сохраняя в списке свободных слотов
-            free_cells.push(index);
-        }else{
-            error!("invalid pid {} received, child cannot be None", index);
-        }
-    }else{
-        error!("invalid pid {} received, index out of bound", index);
-    }
+    // Ищем по нужному индексу + извлекаем элемент и делаем его None
+    children_txs
+        .get_mut(index)
+        .expect("invalid pid received, index out of bound")
+        .take()
+        .expect("invalid pid received, child cannot be None");
+
+    // При этом сохраняя в списке свободных слотов
+    free_cells.push(index);
 }
