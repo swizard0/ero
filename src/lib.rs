@@ -17,7 +17,7 @@ pub enum ErrorSeverity<S, A> {
 
 /// Стратегия для рестарта
 pub enum RestartStrategy {
-    /// Сразу же падаем
+    /// Сразу же падаем, даже если актор вернул восстанавливаемый тип ошибки
     InstantCrash,
     /// Рестарт мгновенный
     RestartImmediately,
@@ -31,7 +31,7 @@ pub struct Params<N> {
     pub restart_strategy: RestartStrategy,
 }
 
-// TODO: ???
+// Команда на завершения работы
 pub struct Terminate<R>(pub R);
 
 /// Ошибка, что актор недоступен для работы

@@ -30,21 +30,11 @@ use super::{
     ErrorSeverity,
 };
 
+/////////////////////////////////////////////////////////////////////////////////////
+
 pub struct PoolGenServer<MT> {
     tasks_tx: mpsc::Sender<MT>,
     fused_tasks_rx: stream::Fuse<mpsc::Receiver<MT>>,
-}
-
-pub struct PoolPid<MT> {
-    tasks_tx: mpsc::Sender<MT>,
-}
-
-impl<MT> Clone for PoolPid<MT> {
-    fn clone(&self) -> Self {
-        PoolPid {
-            tasks_tx: self.tasks_tx.clone(),
-        }
-    }
 }
 
 impl<MT> Default for PoolGenServer<MT>{
@@ -69,6 +59,13 @@ impl<MT> PoolGenServer<MT> {
         }
     }
 
+    /// Запуск в работу пула
+    /// 
+    /// Параметры:
+    /// TODO: !!!
+    /// - `slaves_bootstrap` - функтор, который создает футуру слейва
+    /// - `slaves_handler` -  TODO: функтор, обрабатывающий изменение состояние слейва 
+    /// - `slaves_iter` - итератор по параметрам запускаемых слейвов
     #[allow(clippy::too_many_arguments)]
     pub async fn run<MN, SN, MB, FMB, EMB, BMS, MS, C, FC, EC, SB, FSB, ESB, BSS, SS, H, FH, EH, ST, I>(
         self,
@@ -104,13 +101,20 @@ impl<MT> PoolGenServer<MT> {
           I: IntoIterator<Item = (Params<SN>, BSS)>,
 
     {
+        // Получаем дочерний гипервизор
         let supervisor_gen_server =
             parent_supervisor.child_supervisor();
+        // Затем его pid для коммуникации
         let mut supervisor = supervisor_gen_server.pid();
 
+        // Создаем канал для коммуникации
         let (slaves_tx, slaves_rx) = mpsc::channel(0);
+        // Рессивер для задач
         let fused_tasks_rx = self.fused_tasks_rx;
+
+        // Спавним актор под супервизором
         supervisor.spawn_link_permanent(async move {
+            // TODO: ???
             let master_result = run_master(
                 master_params,
                 master_init_state,
@@ -141,14 +145,22 @@ impl<MT> PoolGenServer<MT> {
             }
         });
 
+        // Оборачиваем в Arc переданные параметры для удобной возможности шарить между слейвами
         let shared_bootstrap = Arc::new(slaves_bootstrap);
         let shared_handler = Arc::new(slaves_handler);
 
+        // Итератор по слейвам
         for (params, init_state) in slaves_iter {
+            // Клонируем "параметры" для создания слейвов
+            // Клонируем функтор для создания нашего актора-слейва с параметрами
             let bootstrap = shared_bootstrap.clone();
+            // TODO: Клонируем обработчик результатов работы слейва
             let handler = shared_handler.clone();
+            // Отправитель статусов работы слейвов
             let slaves_tx = slaves_tx.clone();
+            // Запуск слейва под гипервизором
             supervisor.spawn_link_permanent(async move {
+                // Стартуем слейва
                 let slave_result = run_slave(
                     params,
                     init_state,
@@ -156,6 +168,7 @@ impl<MT> PoolGenServer<MT> {
                     slaves_tx,
                     move |task, state| handler(task, state),
                 ).await;
+
                 match slave_result {
                     Ok(()) =>
                         (),
@@ -178,12 +191,28 @@ impl<MT> PoolGenServer<MT> {
 
 }
 
+/////////////////////////////////////////////////////////////////////////////////////
+
+pub struct PoolPid<MT> {
+    tasks_tx: mpsc::Sender<MT>,
+}
+
+impl<MT> Clone for PoolPid<MT> {
+    fn clone(&self) -> Self {
+        PoolPid {
+            tasks_tx: self.tasks_tx.clone(),
+        }
+    }
+}
+
 impl<MT> PoolPid<MT> {
     pub async fn push_task(&mut self, task: MT) -> Result<(), NoProcError> {
         self.tasks_tx.send(task).await
             .map_err(|_send_error| NoProcError)
     }
 }
+
+/////////////////////////////////////////////////////////////////////////////////////
 
 #[derive(Debug)]
 pub enum MasterError<EB, EC> {
@@ -197,6 +226,7 @@ pub enum MasterError<EB, EC> {
     CrashForced,
 }
 
+/// Запуск родительского актора
 async fn run_master<N, B, FB, EB, BS, C, FC, EC, S, MT, ST>(
     params: Params<N>,
     init_state: BS,
@@ -220,6 +250,7 @@ where N: AsRef<str>,
         converter: C,
     }
 
+    // Создаем перезапускаемую футуру из текущей
     restart::restartable(
         params,
         RestartableState {
@@ -231,12 +262,18 @@ where N: AsRef<str>,
         },
         |RestartableState { state: init_state, bootstrap, mut fused_tasks_rx, mut fused_slaves_rx, converter, }| {
             async move {
+                // TODO:
+                // Создаем параметры для старта из начального состояния
                 let bootstrap_result = bootstrap(init_state).await;
+
+                // Состояние после старта
                 let mut state = match bootstrap_result {
                     Ok(state) =>
                         state,
+                    // Там внутри критичная ошибка
                     Err(ErrorSeverity::Fatal(error)) =>
                         return Err(ErrorSeverity::Fatal(MasterError::Bootstrap(error))),
+                    // Восстанавливаемая ошибка
                     Err(ErrorSeverity::Recoverable { state, }) =>
                         return Err(ErrorSeverity::Recoverable {
                             state: RestartableState { state, bootstrap, fused_tasks_rx, fused_slaves_rx, converter, },
@@ -307,6 +344,8 @@ where N: AsRef<str>,
         })
 }
 
+/////////////////////////////////////////////////////////////////////////////////////
+
 #[derive(Debug)]
 pub enum SlaveError<EB, EH> {
     Bootstrap(EB),
@@ -316,6 +355,12 @@ pub enum SlaveError<EB, EH> {
     CrashForced,
 }
 
+/// Запуск в работу дочернего актора
+/// - `params` - параметры рестарта актора
+/// - `init_state` - начальные параметры для старта актора
+/// - `bootstrap` - функтор, который пересоздает футуру, которая и будет нашим актором
+/// - `slaves_tx` - TODO: канал для отправки состояния слейвов
+/// - `handler` - TODO: обработчик для запуска
 async fn run_slave<N, B, EB, FB, BS, S, T, H, EH, FH>(
     params: Params<N>,
     init_state: BS,
@@ -337,31 +382,46 @@ where N: AsRef<str>,
         handler: H,
     }
 
+    // Запускаем рестартуемую футуру
     restart::restartable(
+        // Параметры рестарта
         params,
+        // Непосредственно параметры для старта актора
         RestartableState { state: init_state, bootstrap, slaves_tx, handler, },
         |RestartableState { state: init_state, bootstrap, mut slaves_tx, handler, }| {
             async move {
+                // Создаем футуру на исполнение
                 let bootstrap_result = bootstrap(init_state).await;
+                
+                // Успешно ли смогли создать эту футуру?
                 let mut state = match bootstrap_result {
                     Ok(state) =>
                         state,
+                    // Если не смогли совсем - кидаем ошибку создания
                     Err(ErrorSeverity::Fatal(error)) =>
                         return Err(ErrorSeverity::Fatal(SlaveError::Bootstrap(error))),
-                    Err(ErrorSeverity::Recoverable { state, }) =>
+                    // Вернулась восстанавливаемая ошибка
+                    Err(ErrorSeverity::Recoverable { state, }) => 
+                        // Возвращаем значит снова восстанавливаемую ошибку с тем же самым состоянием
                         return Err(ErrorSeverity::Recoverable {
                             state: RestartableState { state, bootstrap, slaves_tx, handler, },
                         }),
                 };
 
+                // Цикл работы со слейвами
                 loop {
+                    // Одноразовый канал
                     let (task_tx, task_rx) = oneshot::channel();
+
+                    // Отправляем в обратный управления этот одноразовый канал
                     slaves_tx.send(task_tx).await
                         .map_err(|_send_error| ErrorSeverity::Fatal(SlaveError::MasterChannelDropped))?;
 
+                    // Ждем ответа для получения задачи
                     let task = task_rx.await
                         .map_err(|oneshot::Canceled| ErrorSeverity::Fatal(SlaveError::TasksChannelDropped))?;
 
+                    // Вызываем обработчик задачи
                     match handler(task, state).await {
                         Ok(next_state) =>
                             state = next_state,
