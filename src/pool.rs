@@ -47,14 +47,20 @@ impl<MT> Clone for PoolPid<MT> {
     }
 }
 
-impl<MT> PoolGenServer<MT> {
-    pub fn new() -> PoolGenServer<MT> {
+impl<MT> Default for PoolGenServer<MT>{
+    fn default() -> Self {
         let (tasks_tx, tasks_rx) = mpsc::channel(0);
 
         PoolGenServer {
             tasks_tx,
             fused_tasks_rx: tasks_rx.fuse(),
         }
+    }
+}
+
+impl<MT> PoolGenServer<MT> {
+    pub fn new() -> PoolGenServer<MT> {
+        Self::default()
     }
 
     pub fn pid(&self) -> PoolPid<MT> {
@@ -63,6 +69,7 @@ impl<MT> PoolGenServer<MT> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn run<MN, SN, MB, FMB, EMB, BMS, MS, C, FC, EC, SB, FSB, ESB, BSS, SS, H, FH, EH, ST, I>(
         self,
         parent_supervisor: supervisor::SupervisorPid,
