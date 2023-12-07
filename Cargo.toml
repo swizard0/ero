@@ -3,6 +3,8 @@ name = "ero"
 version = "0.14.6"
 authors = ["Alexey Voznyuk <me@swizard.info>"]
 description = "Erlang-inspired framework for organizing async code in a fault-tolerant way"
+license = "MIT"
+repository = "https://github.com/swizard0/ero"
 edition = "2021"
 
 [dependencies]
